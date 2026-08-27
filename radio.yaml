@@ -310,6 +310,15 @@ speaker:
     bits_per_sample: 16bit
     channel: stereo
 
+    # 100ms, not the 500ms default. The speaker's ring buffer is sized from
+    # this: at 44100Hz stereo 16-bit that is 176400 bytes per second, so the
+    # default asked for 88200 bytes on a board whose entire free heap is
+    # around a hundred kilobytes.
+    #
+    # The floor is 50ms (DMA_BUFFER_DURATION_MS * DMA_BUFFERS_COUNT), so there
+    # is a little room left below this if it is ever needed.
+    buffer_duration: 100ms
+
 #
 # https://esphome.io/components/media_player/speaker
 #
@@ -327,6 +336,26 @@ media_player:
     id: radio_player
     name: Radio
     volume_initial: 60%
+
+    #
+    # THIS IS WHAT CAUSED "Media reader encountered an error: ESP_ERR_NO_MEM".
+    #
+    # The default is 1000000 - one megabyte - and it is allocated as a single
+    # ring buffer (audio_pipeline.cpp: RingBuffer::create(buffer_size_)) inside
+    # the reader task, which is why the failure is reported against the reader.
+    # An ESP32 without PSRAM has roughly 320kB of DRAM in total, so that
+    # allocation cannot ever succeed here. The default is written for boards
+    # that have PSRAM.
+    #
+    # 32kB holds about two seconds of a 128kbit/s stream. It also sets the
+    # transfer buffers, which are min(buffer_size / 4, 24kB) each and are
+    # allocated three times over - once in the reader, twice in the decoder -
+    # so this line is worth 32 + 8 + 16 = 56kB rather than the 32 it names.
+    #
+    # If playback stutters on a weak signal, raise this before anything else,
+    # and watch Heap Free while you do.
+    #
+    buffer_size: 32768
 
     # Playing is shown by leaving btn_play_stop CHECKED, which the theme draws
     # in its checked colour.
@@ -435,6 +464,39 @@ text_sensor:
 # https://esphome.io/components/sensor
 #
 sensor:
+  #
+  # The two numbers that decide whether a stream can start.
+  #
+  # Worth having permanently on a board with no PSRAM: the audio pipeline
+  # allocates a 32kB ring buffer plus three transfer buffers the moment play is
+  # pressed, and if the heap cannot serve them the only symptom is
+  # "Media reader encountered an error: ESP_ERR_NO_MEM" in the log.
+  #
+  # Read them together. Free can look healthy while the largest contiguous
+  # block is far smaller - that is fragmentation, and a ring buffer needs one
+  # contiguous run. The web server is what fragments a heap here: it allocates
+  # per request and holds an open event stream per client.
+  #
+  - platform: template
+    name: "Heap Free"
+    entity_category: diagnostic
+    unit_of_measurement: "B"
+    accuracy_decimals: 0
+    state_class: measurement
+    icon: mdi:memory
+    update_interval: 60s
+    lambda: 'return (float) esp_get_free_heap_size();'
+
+  - platform: template
+    name: "Heap Largest Block"
+    entity_category: diagnostic
+    unit_of_measurement: "B"
+    accuracy_decimals: 0
+    state_class: measurement
+    icon: mdi:memory
+    update_interval: 60s
+    lambda: 'return (float) heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);'
+
   - platform: adc
     pin: GPIO34
     name: Ambient Light
@@ -526,7 +588,12 @@ touchscreen:
 # >>> LVGL Designer - generated from the canvas. >>>
 # This block is regenerated from the canvas - edits here are not preserved.
 lvgl:
-  buffer_size: 25%
+  # 10%, down from 25%. 25% of a 320x240 16-bit screen is 38kB held for the
+  # lifetime of the device; 10% is 15kB, and the 23kB difference is most of
+  # what the audio pipeline needed. LVGL just renders in more strips per
+  # frame, which on a screen this static is not visible.
+  buffer_size: 10%
+  rotation: 90°
   theme:
     dark_mode: true
   pages:
@@ -567,7 +634,7 @@ lvgl:
             id: lv_line
             x: 0
             y: 18
-            width: 320
+            width: 100%
             height: 1
             points:
               - 0, 0
@@ -591,7 +658,7 @@ lvgl:
             id: lbl_station
             x: 0
             y: 50
-            width: 320
+            width: 100%
             text: ""
             text_color: 0xFFFFFF
             long_mode: SCROLL
@@ -601,7 +668,7 @@ lvgl:
             id: lv_buttonmatrix
             x: 0
             y: 0
-            width: 320
+            width: 100%
             height: 80
             align: BOTTOM_MID
             bg_opa: 0%
