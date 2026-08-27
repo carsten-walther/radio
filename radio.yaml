@@ -12,9 +12,35 @@ substitutions:
   version: 2026.8.27
   area: Miscellaneous
 
-  RADIO_STATIONS:
-    - id: Klassik
-      url: http://live.streams.klassikradio.de/klassikradio-deutschland/stream/mp3
+  #
+  # The station list is NOT here any more - see the `stations` global below.
+  #
+  # A substitution holding a LIST is silently useless: ${...} does textual
+  # replacement of strings, so a list resolves to the EMPTY STRING rather than
+  # to an error. It reads as configured and does nothing.
+  #
+
+  #
+  # I2S pins for the external DAC.
+  #
+  # Free on this board once the display (14/13/12/15/2), touch (33/36),
+  # backlight (27), RGB LED (4/16/17), LDR (34) and the SD bus (5/23/18/19)
+  # have taken theirs: GPIO21, 22, 25 and 32. Three are needed, 32 stays spare.
+  #
+  # GPIO26 is deliberately not among them although it is now unused. It carries
+  # the ON-BOARD amplifier, which is fed by the internal DAC - and ESPHome
+  # 2026.7 rejects that outright ("Internal DAC is no longer supported", a hard
+  # error in the i2s_audio speaker's FINAL_VALIDATE_SCHEMA), so the on-board
+  # speaker cannot be driven at all. An I2S data line there would push a
+  # digital signal into an analogue amplifier input: noise, not audio.
+  #
+  # CHECK ALL THREE ARE BROKEN OUT before wiring. GPIO21 and GPIO22 sit on the
+  # CN1/P3 header on these boards; GPIO25 is the one to verify, and GPIO32 is
+  # the fallback if it is not reachable.
+  #
+  PIN_I2S_BCLK: GPIO22
+  PIN_I2S_LRCLK: GPIO21
+  PIN_I2S_DOUT: GPIO25
 
 #
 # https://esphome.io/components/esphome
@@ -28,6 +54,20 @@ esphome:
   project:
     name: "${author_name}.${project_name}"
     version: "${version}"
+
+  #
+  # Put the restored station's name on the panel. play: false - coming back
+  # from a power cut should not start making noise on its own.
+  #
+  # Priority -100 so it runs after everything is up; lvgl is a component like
+  # any other and lbl_station has to exist before a label call reaches it.
+  #
+  on_boot:
+    - priority: -100
+      then:
+        - script.execute:
+            id: station_apply
+            play: false
 
 #
 # https://esphome.io/components/esp32
@@ -52,9 +92,9 @@ wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
   domain: .local
-  fast_connect: False
+  fast_connect: false
   power_save_mode: NONE
-  enable_on_boot: True
+  enable_on_boot: true
   output_power: 20dB
   ap:
     ssid: "${project_name}"
@@ -105,8 +145,8 @@ mqtt:
   username: !secret mqtt_username
   password: !secret mqtt_password
   reboot_timeout: 0s
-  enable_on_boot: False
-  discovery: False
+  enable_on_boot: false
+  discovery: false
   keepalive: 60s
 
 #
@@ -115,7 +155,6 @@ mqtt:
 web_server:
   port: 80
   version: 3
-  local: True
   auth:
     type: digest
     username: !secret web_username
@@ -125,7 +164,7 @@ web_server:
 # https://esphome.io/components/logger
 #
 logger:
-  level: DEBUG
+  level: ERROR
 
 #
 # https://esphome.io/components/time/sntp
@@ -163,6 +202,158 @@ spi:
     miso_pin:
       number: GPIO12
       ignore_strapping_warning: true
+
+#
+# https://esphome.io/components/globals
+#
+globals:
+  #
+  # THE STATION LIST. One entry per line, "Name|URL".
+  #
+  # One vector of joined strings rather than two parallel vectors of names and
+  # URLs. Parallel lists are the classic way to get a station playing under
+  # another station's name: nothing structurally stops them drifting out of
+  # step, and the index that reads them cannot tell. Here the pairing cannot
+  # come apart, and adding a station is one line.
+  #
+  # It lives here rather than in substitutions: because a substitution can only
+  # hold a string - see the note up there.
+  #
+  - id: stations
+    type: std::vector<std::string>
+    restore_value: no
+    initial_value: |-
+      {
+        "Klassik Radio|http://live.streams.klassikradio.de/klassikradio-deutschland/stream/mp3",
+        "Toggo Radio|http://radio.toggo.de/live/mp3-128/airable",
+        "BEATS Radio|http://stream.klassikradio.de/beats/mp3",
+      }
+
+  #
+  # Which of them is selected. Restored, so the radio comes back on the station
+  # it was left on; station_apply wraps it into range on every use, so a stored
+  # index that outlived its station cannot point past the end.
+  #
+  - id: station_index
+    type: int
+    restore_value: yes
+    initial_value: '0'
+
+#
+# https://esphome.io/components/script
+#
+script:
+  #
+  # The one place the station list is read.
+  #
+  # Every button goes through here rather than reaching into the list itself,
+  # so the wrap-around, the name/URL split and the label update exist once.
+  #
+  # `play` says whether to start the stream as well as show it. Stepping with
+  # btn_back/btn_next passes whatever is already running, so browsing while
+  # stopped stays stopped and browsing while playing switches station without
+  # a stop in between.
+  #
+  - id: station_apply
+    mode: restart
+    parameters:
+      play: bool
+    then:
+      - lambda: |-
+          const auto &list = id(stations);
+          if (list.empty()) {
+            return;
+          }
+
+          const int count = (int) list.size();
+          // Wrapped here and nowhere else, so the buttons can just add or
+          // subtract 1 and a restored index is bounded even if the list shrank.
+          const int index = ((id(station_index) % count) + count) % count;
+          id(station_index) = index;
+
+          const std::string &entry = list[index];
+          const size_t sep = entry.find('|');
+          const std::string name = entry.substr(0, sep);
+          const std::string url = (sep == std::string::npos) ? std::string() : entry.substr(sep + 1);
+
+          lv_label_set_text(id(lbl_station), name.c_str());
+
+          if (play && !url.empty()) {
+            id(radio_player)
+                ->make_call()
+                .set_media_url(url)
+                .set_command(media_player::MEDIA_PLAYER_COMMAND_PLAY)
+                .perform();
+          }
+
+#
+# https://esphome.io/components/i2s_audio
+#
+# The on-board amplifier on GPIO26 cannot be used - see the pin note in
+# substitutions. This drives an external I2S DAC (MAX98357A or PCM5102).
+#
+i2s_audio:
+  - id: i2s_bus
+    i2s_bclk_pin: ${PIN_I2S_BCLK}
+    i2s_lrclk_pin: ${PIN_I2S_LRCLK}
+
+#
+# https://esphome.io/components/speaker/i2s_audio
+#
+speaker:
+  - platform: i2s_audio
+    id: radio_speaker
+    i2s_audio_id: i2s_bus
+    dac_type: external
+    i2s_dout_pin: ${PIN_I2S_DOUT}
+    sample_rate: 44100
+    bits_per_sample: 16bit
+    channel: stereo
+
+#
+# https://esphome.io/components/media_player/speaker
+#
+# Only announcement_pipeline, and that is a supported arrangement rather than
+# a shortcut: the schema requires it, the media pipeline is optional, and the
+# two cannot share one speaker without the mixer component. With only this one
+# defined the player runs in single-pipeline mode - every command path checks
+# single_pipeline_() and routes here, so ordinary playback works.
+#
+# format: MP3 is what pulls in the decoder, and it is what costs the flash:
+# 76.4% -> 85.5% measured on this config.
+#
+media_player:
+  - platform: speaker
+    id: radio_player
+    name: Radio
+    volume_initial: 60%
+
+    # Playing is shown by leaving btn_play_stop CHECKED, which the theme draws
+    # in its checked colour.
+    #
+    # Not by swapping the icon: a buttonmatrix button is a pseudo-widget with
+    # an empty modify schema, so lvgl.widget.update rejects `text` outright
+    # ("[text] is an invalid option"). The whole matrix would have to be
+    # rebuilt to change one glyph.
+    #
+    # It follows the PLAYER, not the button that was pressed - a stream that
+    # dies, or a stop sent from Home Assistant, moves it too, which it would
+    # not if the button handler flipped it.
+    on_play:
+      - lvgl.widget.update:
+          id: btn_play_stop
+          state:
+            checked: true
+    on_idle:
+      - lvgl.widget.update:
+          id: btn_play_stop
+          state:
+            checked: false
+    announcement_pipeline:
+      speaker: radio_speaker
+      format: MP3
+      sample_rate: 44100
+      num_channels: 2
 
 #
 # https://esphome.io/components/output
@@ -228,7 +419,7 @@ text_sensor:
   - platform: wifi_info
     ip_address:
       id: wifi_ip
-      internal: True
+      internal: true
       on_value:
         then:
           - lvgl.label.update:
@@ -424,12 +615,46 @@ lvgl:
               text_color: 0xFFFFFF
             rows:
               - buttons:
+                  # Step back a station. Keeps playing if it was playing, so
+                  # browsing switches stream rather than stopping first.
                   - id: btn_back
                     text: "\uF048"
+                    on_click:
+                      - lambda: 'id(station_index) -= 1;'
+                      - script.execute:
+                          id: station_apply
+                          play: !lambda |-
+                            return id(radio_player)->state == media_player::MEDIA_PLAYER_STATE_PLAYING;
+
+                  # Play the selected station, or stop what is running.
+                  #
+                  # The state is read from the player rather than kept in a
+                  # global: Home Assistant, the web interface and this button
+                  # all drive the same player, and a mirrored flag would be
+                  # wrong the moment one of the others acted.
                   - id: btn_play_stop
                     text: "\uF04B"
+                    on_click:
+                      - if:
+                          condition:
+                            lambda: |-
+                              return id(radio_player)->state == media_player::MEDIA_PLAYER_STATE_PLAYING;
+                          then:
+                            - media_player.stop:
+                                id: radio_player
+                          else:
+                            - script.execute:
+                                id: station_apply
+                                play: true
+
                   - id: btn_next
                     text: "\uF051"
+                    on_click:
+                      - lambda: 'id(station_index) += 1;'
+                      - script.execute:
+                          id: station_apply
+                          play: !lambda |-
+                            return id(radio_player)->state == media_player::MEDIA_PLAYER_STATE_PLAYING;
               - buttons:
                   - id: btn_vol_down
                     text: "\uF027"
