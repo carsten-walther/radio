@@ -1,0 +1,337 @@
+# ═══════════════════════════════════════════════════════════
+#  Radio
+#  Internet Radio | MQTT | Home Assistant
+#  Board: Sunton ESP32-2432S024R (CYD, 2.4" ILI9341 + XPT2046)
+# ═══════════════════════════════════════════════════════════
+
+substitutions:
+  project_name: radio
+  author_name: carsten-walther
+  friendly_name: Radio
+  comment: Internet Radio
+  version: 2026.8.27
+  area: Miscellaneous
+
+esphome:
+  name: "${project_name}"
+  friendly_name: "${friendly_name}"
+  comment: "${comment}"
+  area: "${area}"
+  min_version: 2026.2.0
+  project:
+    name: "${author_name}.${project_name}"
+    version: "${version}"
+
+#
+# https://esphome.io/components/esp32
+#
+esp32:
+  board: esp32dev
+  cpu_frequency: 240MHZ
+  framework:
+    type: esp-idf
+
+#
+# https://esphome.io/components/esphome#preferences
+#
+preferences:
+  flash_write_interval: 5min
+
+#
+# https://esphome.io/components/wifi
+#
+wifi:
+  id: wifi_id
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  domain: .local
+  fast_connect: False
+  power_save_mode: NONE
+  enable_on_boot: True
+  output_power: 20dB
+  ap:
+    ssid: "${project_name}"
+    password: !secret wifi_ap_password
+
+#
+# https://esphome.io/components/captive_portal
+#
+captive_portal:
+
+#
+# https://esphome.io/components/ota
+#
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+#
+# https://esphome.io/components/api
+#
+api:
+  encryption:
+    key: !secret api_encryption_key
+  reboot_timeout: 0s
+
+#
+# https://esphome.io/components/mqtt
+#
+mqtt:
+  id: mqtt_client_id
+  broker: !secret mqtt_broker
+  username: !secret mqtt_username
+  password: !secret mqtt_password
+  reboot_timeout: 0s
+  enable_on_boot: False
+  discovery: False
+  keepalive: 60s
+
+#
+# https://esphome.io/components/web_server
+#
+web_server:
+  port: 80
+  version: 3
+  local: True
+  auth:
+    type: digest
+    username: !secret web_username
+    password: !secret web_password
+
+#
+# https://esphome.io/components/logger
+# Keep DEBUG until the touch orientation is confirmed, then set back to ERROR.
+#
+logger:
+  level: DEBUG
+
+#
+# https://esphome.io/components/time/sntp
+#
+time:
+  - platform: sntp
+    id: time_id
+    timezone: Europe/Berlin
+    on_time:
+      - seconds: 0
+        then:
+          - lvgl.label.update:
+              id: lbl_time
+              text: !lambda return id(time_id).now().strftime("%H:%M");
+          - lvgl.label.update:
+              id: lbl_date
+              text: !lambda return id(time_id).now().strftime("%d.%m.%Y");
+
+# ═══════════════════════════════════════════════════════════
+#  CYD (ESP32-2432S024R)
+#  Pins taken from the Sunton board definition:
+#  TFT   ILI9341  SCLK 14 / MOSI 13 / MISO 12 / CS 15 / DC 2, no reset
+#  Touch XPT2046  same bus, CS 33, IRQ 36
+#  Backlight 27, RGB LED 4/16/17 (active low), LDR 34, speaker amp 26
+#  SD card on its own bus: CS 5 / MOSI 23 / SCLK 18 / MISO 19
+# ═══════════════════════════════════════════════════════════
+
+# Single SPI bus shared by TFT (ILI9341) and touch (XPT2046),
+# exactly as they are wired on the board.
+spi:
+  - id: spi_bus
+    clk_pin: GPIO14
+    mosi_pin: GPIO13
+    miso_pin:
+      number: GPIO12
+      ignore_strapping_warning: true
+
+output:
+  - id: backlight_pwm
+    platform: ledc
+    pin: GPIO27
+
+  - id: led_r
+    platform: ledc
+    pin:
+      number: GPIO4
+      inverted: true
+
+  - id: led_g
+    platform: ledc
+    pin:
+      number: GPIO16
+      inverted: true
+
+  - id: led_b
+    platform: ledc
+    pin:
+      number: GPIO17
+      inverted: true
+
+light:
+  - id: backlight
+    platform: monochromatic
+    output: backlight_pwm
+    name: Display Backlight
+    restore_mode: ALWAYS_ON
+
+  - id: status_rgb
+    platform: rgb
+    name: Status LED
+    red: led_r
+    green: led_g
+    blue: led_b
+    restore_mode: ALWAYS_OFF
+
+sensor:
+  - platform: adc
+    pin: GPIO34
+    name: Ambient Light
+    id: ambient_light
+    attenuation: 12db
+    update_interval: 30s
+
+display:
+  - platform: mipi_spi
+    id: esp_display
+    model: ESP32-2432S028
+    spi_id: spi_bus
+    cs_pin:
+      number: GPIO15
+      ignore_strapping_warning: true
+    dc_pin:
+      number: GPIO2
+      ignore_strapping_warning: true
+    data_rate: 40MHz
+    # Confirmed on hardware: buttons render in LVGL's default blue,
+    # so this channel order is correct despite the board definition
+    # declaring BGR.
+    color_order: RGB
+    invert_colors: false
+    # Panel is natively 240x320 portrait. swap_xy performs the rotation
+    # via MADCTL; dimensions must match it. If the two disagree, every
+    # row overruns into the next and the image tears diagonally.
+    transform:
+      swap_xy: true
+      mirror_x: true
+      mirror_y: false
+    dimensions:
+      width: 320
+      height: 240
+    auto_clear_enabled: false
+    update_interval: never
+
+touchscreen:
+  platform: xpt2046
+  id: esp_touch
+  spi_id: spi_bus
+  cs_pin: GPIO33
+  interrupt_pin: GPIO36
+  data_rate: 2MHz
+  update_interval: 50ms
+  threshold: 400
+  # Measured on this panel. These stay tied to the raw axes -
+  # x_min/x_max to raw_x, y_min/y_max to raw_y - independent of the
+  # transform below.
+  calibration:
+    x_min: 270
+    x_max: 3870
+    y_min: 420
+    y_max: 3790
+  # Must follow the display rotation above.
+  transform:
+    swap_xy: true
+    mirror_x: true
+    mirror_y: false
+  # Verification helper - remove once the mapping is confirmed.
+  on_touch:
+    - lambda: |-
+        ESP_LOGI("cal", "x=%d y=%d  raw_x=%d raw_y=%d",
+                 touch.x, touch.y, touch.x_raw, touch.y_raw);
+
+# >>> LVGL Designer - generated from the canvas. >>>
+# This block is regenerated from the canvas - edits here are not preserved.
+lvgl:
+  # 320x240x16bit is ~150 kB. A full-size buffer will not fit in
+  # internal RAM next to WiFi/API/web_server on a board without PSRAM.
+  buffer_size: 25%
+  pages:
+    - id: canvas_1
+      bg_color: 0x000000
+      pad_all: 0
+      # Keeps a widget that overhangs the edge from turning the whole
+      # page into a scroll area.
+      scrollable: false
+      scrollbar_mode: "OFF"
+      widgets:
+        - label:
+            id: lbl_time
+            x: 0
+            y: 0
+            align: TOP_LEFT
+            text: "23:59"
+            text_color: 0xFFFFFF
+            text_font: montserrat_18
+
+        - label:
+            id: lbl_battery
+            x: 0
+            y: 0
+            align: TOP_MID
+            text: "\uF244"
+            text_color: 0xFFFFFF
+            text_font: montserrat_18
+
+        - label:
+            id: lbl_ip
+            x: 20
+            y: 0
+            align: TOP_MID
+            text: "127.0.0.1"
+            text_color: 0xFFFFFF
+            text_font: montserrat_18
+
+        - label:
+            id: lbl_date
+            x: 0
+            y: 0
+            align: TOP_RIGHT
+            text: "24.12.2026"
+            text_color: 0xFFFFFF
+            text_font: montserrat_18
+
+        - button:
+            id: btn_back
+            x: 10
+            y: 190
+            width: 60
+            height: 40
+            radius: 4
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "\uF048"
+                  text_font: montserrat_24
+
+        - button:
+            id: btn_play_stop
+            x: 128
+            y: 190
+            width: 60
+            height: 40
+            radius: 4
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "\uF04B"
+                  text_font: montserrat_24
+
+        - button:
+            id: btn_next
+            x: 250
+            y: 190
+            width: 60
+            height: 40
+            radius: 4
+            widgets:
+              - label:
+                  align: CENTER
+                  text: "\uF051"
+                  text_font: montserrat_24
+# <<< end LVGL Designer block <<<
