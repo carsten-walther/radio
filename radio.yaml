@@ -12,6 +12,10 @@ substitutions:
   version: 2026.8.27
   area: Miscellaneous
 
+  RADIO_STATIONS:
+    - id: Klassik
+      url: http://live.streams.klassikradio.de/klassikradio-deutschland/stream/mp3
+
 #
 # https://esphome.io/components/esphome
 #
@@ -55,6 +59,22 @@ wifi:
   ap:
     ssid: "${project_name}"
     password: !secret wifi_ap_password
+
+  #
+  # The other half of lbl_ip. There is no on_connect counterpart here on
+  # purpose - the wifi_info text_sensor already covers arriving, and it does it
+  # better, because it fires on the IP rather than on the association.
+  #
+  # This is needed because nothing else covers LEAVING. On esp-idf the IP state
+  # listeners are notified from IP_EVENT_STA_GOT_IP only
+  # (wifi_component_esp_idf.cpp), so a dropped link never publishes anything and
+  # the panel would keep showing an address the device no longer has.
+  #
+  on_disconnect:
+    then:
+      - lvgl.label.update:
+          id: lbl_ip
+          text: "---.---.---.---"
 
 #
 # https://esphome.io/components/captive_portal
@@ -189,6 +209,38 @@ light:
     restore_mode: ALWAYS_OFF
 
 #
+# https://esphome.io/components/text_sensor/wifi_info
+#
+# The source for lbl_ip, and internal because it exists to feed the panel
+# rather than to be an entity - drop that line to have it in Home Assistant
+# too.
+#
+# This platform rather than a wifi: on_connect lambda, and the difference
+# matters: IPAddressWiFiInfo is a WiFiIPStateListener, so it fires when the
+# IP actually arrives. on_connect fires on association, which is before DHCP
+# has answered - reading the address there gets 0.0.0.0 often enough to look
+# like a race that comes and goes.
+#
+# It also fires again by itself when the lease changes or the device moves to
+# another access point, which a one-shot on_connect would miss.
+#
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      id: wifi_ip
+      internal: True
+      on_value:
+        then:
+          - lvgl.label.update:
+              id: lbl_ip
+              # An unset address stringifies to 0.0.0.0, which is what this
+              # publishes while the radio is down or associated but not yet
+              # leased. Showing that as if it were an address would be a lie;
+              # the placeholder says "no network" without pretending.
+              text: !lambda |-
+                return (x.empty() || x == "0.0.0.0") ? "---.---.---.---" : x;
+
+#
 # https://esphome.io/components/sensor
 #
 sensor:
@@ -200,12 +252,40 @@ sensor:
     update_interval: 30s
 
 #
+# https://esphome.io/components/media_source
+#
+media_source:
+  - platform: audio_http
+    id: http_source
+
+#
 # https://esphome.io/components/display
 #
 display:
   - platform: mipi_spi
     id: esp_display
-    model: ESP32-2432S028
+
+    #
+    # ESPHome has NO model for the S024. The whole list is ESP32-2432S028
+    # (ILI9341), ESP32-2432S028-7789 (ST7789V), ESP32-2432S028-9342 (ILI9342)
+    # and ESP32-2424S012 (GC9A01A) - so this borrows a 2.8" board's model.
+    # That is fine for the pins, which are identical (CS 15, DC 2, 40MHz);
+    # only the controller is in question.
+    #
+    # It was ESP32-2432S028, i.e. the ILI9341 init sequence, and the panel
+    # showed nothing but stripes. Stripes are what a controller does when it
+    # did not accept the init sequence - and the sequence reaching it is
+    # well-formed: a software reset IS emitted (no reset_pin means SWRESET
+    # plus a 10ms settling delay), the config resolves, the build is clean.
+    # So what arrives is correct and simply not what this panel speaks.
+    #
+    # The 2.4" boards are commonly ST7789 where the micro-USB 2.8" is ILI9341.
+    # If this is still striped, try ESP32-2432S028-9342, and after that drop
+    # data_rate to 10MHz - a bus too fast for the wiring corrupts pixel data
+    # the same way. Rotation and mirroring cannot cause stripes and are not
+    # worth changing while the panel is in this state.
+    #
+    model: ESP32-2432S028-7789
     spi_id: spi_bus
     cs_pin:
       number: GPIO15
@@ -214,16 +294,16 @@ display:
       number: GPIO2
       ignore_strapping_warning: true
     data_rate: 40MHz
-    color_order: RGB
+    color_order: BGR
     invert_colors: false
     auto_clear_enabled: false
     update_interval: never
     dimensions:
-      width: 240
-      height: 320
+      width: 320
+      height: 240
     transform:
-      swap_xy: false
-      mirror_x: false
+      swap_xy: true
+      mirror_x: true
       mirror_y: false
 
 #
@@ -238,25 +318,15 @@ touchscreen:
   data_rate: 2MHz
   update_interval: 50ms
   threshold: 400
-  # Measured on this panel. These stay tied to the raw axes -
-  # x_min/x_max to raw_x, y_min/y_max to raw_y - independent of the
-  # transform below.
   calibration:
     x_min: 270
     x_max: 3870
     y_min: 420
     y_max: 3790
-  # Must follow the display rotation above. mirror_x was flipped to
-  # false because a touch at the top left was reported at the top right.
   transform:
-    swap_xy: true
+    swap_xy: false
     mirror_x: false
     mirror_y: false
-  # Verification helper - remove once the mapping is confirmed.
-  on_touch:
-    - lambda: |-
-        ESP_LOGI("cal", "x=%d y=%d  raw_x=%d raw_y=%d",
-                 touch.x, touch.y, touch.x_raw, touch.y_raw);
 
 #
 # https://esphome.io/components/lvgl
@@ -265,18 +335,13 @@ touchscreen:
 # >>> LVGL Designer - generated from the canvas. >>>
 # This block is regenerated from the canvas - edits here are not preserved.
 lvgl:
-  # Panel is natively 240x320. LVGL rotates to landscape, so the canvas
-  # below is 320x240. With LVGL this must live here, not in the display.
-  rotation: 90°
-  # 320x240x16bit is ~150 kB. A full-size buffer will not fit in
-  # internal RAM next to WiFi/API/web_server on a board without PSRAM.
   buffer_size: 25%
+  theme:
+    dark_mode: true
   pages:
     - id: canvas_1
       bg_color: 0x000000
       pad_all: 0
-      # Keeps a widget that overhangs the edge from turning the whole
-      # page into a scroll area.
       scrollable: false
       scrollbar_mode: "OFF"
       widgets:
@@ -285,9 +350,9 @@ lvgl:
             x: 0
             y: 0
             align: TOP_LEFT
-            text: "23:59"
+            text: "00:00"
             text_color: 0xFFFFFF
-            text_font: montserrat_18
+            text_font: montserrat_14
 
         - label:
             id: lbl_battery
@@ -296,62 +361,80 @@ lvgl:
             align: TOP_MID
             text: "\uF244"
             text_color: 0xFFFFFF
-            text_font: montserrat_18
-
-        - label:
-            id: lbl_ip
-            x: 20
-            y: 0
-            align: TOP_MID
-            text: "127.0.0.1"
-            text_color: 0xFFFFFF
-            text_font: montserrat_18
+            text_font: montserrat_14
 
         - label:
             id: lbl_date
             x: 0
             y: 0
             align: TOP_RIGHT
-            text: "24.12.2026"
+            text: "01.01.1970"
             text_color: 0xFFFFFF
+            text_font: montserrat_14
+
+        - line:
+            id: lv_line
+            x: 0
+            y: 18
+            width: 320
+            height: 1
+            points:
+              - 0, 0
+              - 320, 0
+            line_width: 1
+            line_color: 0xEEEEEE
+
+        - label:
+            id: lbl_ip
+            x: 0
+            y: 20
+            align: TOP_MID
+            # What is on screen from boot until the first lease. It was
+            # 127.0.0.1, which is a real address and reads as one - a device
+            # that never got on the network would have looked like it had.
+            text: "---.---.---.---"
+            text_color: 0xFFFFFF
+            text_font: montserrat_14
+
+        - label:
+            id: lbl_station
+            x: 0
+            y: 50
+            width: 320
+            text: ""
+            text_color: 0xFFFFFF
+            long_mode: SCROLL
+            text_font: montserrat_28
+
+        - buttonmatrix:
+            id: lv_buttonmatrix
+            x: 0
+            y: 0
+            width: 320
+            height: 80
+            align: BOTTOM_MID
+            bg_opa: 0%
+            border_width: 0
+            border_color: 0xE0E0E0
+            radius: 0
             text_font: montserrat_18
-
-        - button:
-            id: btn_back
-            x: 10
-            y: 190
-            width: 60
-            height: 40
-            radius: 4
-            widgets:
-              - label:
-                  align: CENTER
-                  text: "\uF048"
-                  text_font: montserrat_24
-
-        - button:
-            id: btn_play_stop
-            x: 128
-            y: 190
-            width: 60
-            height: 40
-            radius: 4
-            widgets:
-              - label:
-                  align: CENTER
-                  text: "\uF04B"
-                  text_font: montserrat_24
-
-        - button:
-            id: btn_next
-            x: 250
-            y: 190
-            width: 60
-            height: 40
-            radius: 4
-            widgets:
-              - label:
-                  align: CENTER
-                  text: "\uF051"
-                  text_font: montserrat_24
+            pad_all: 0
+            items:
+              bg_color: 0x2196f3
+              text_color: 0xFFFFFF
+            rows:
+              - buttons:
+                  - id: btn_back
+                    text: "\uF048"
+                  - id: btn_play_stop
+                    text: "\uF04B"
+                  - id: btn_next
+                    text: "\uF051"
+              - buttons:
+                  - id: btn_vol_down
+                    text: "\uF027"
+                  - id: btn_vol_up
+                    text: "\uF028"
+                  - id: btn_settings
+                    text: "\uF013"
 # <<< end LVGL Designer block <<<
