@@ -12,6 +12,9 @@ substitutions:
   version: 2026.8.27
   area: Miscellaneous
 
+#
+# https://esphome.io/components/esphome
+#
 esphome:
   name: "${project_name}"
   friendly_name: "${friendly_name}"
@@ -100,7 +103,6 @@ web_server:
 
 #
 # https://esphome.io/components/logger
-# Keep DEBUG until the touch orientation is confirmed, then set back to ERROR.
 #
 logger:
   level: DEBUG
@@ -131,8 +133,9 @@ time:
 #  SD card on its own bus: CS 5 / MOSI 23 / SCLK 18 / MISO 19
 # ═══════════════════════════════════════════════════════════
 
-# Single SPI bus shared by TFT (ILI9341) and touch (XPT2046),
-# exactly as they are wired on the board.
+#
+# https://esphome.io/components/spi
+#
 spi:
   - id: spi_bus
     clk_pin: GPIO14
@@ -141,6 +144,9 @@ spi:
       number: GPIO12
       ignore_strapping_warning: true
 
+#
+# https://esphome.io/components/output
+#
 output:
   - id: backlight_pwm
     platform: ledc
@@ -164,6 +170,9 @@ output:
       number: GPIO17
       inverted: true
 
+#
+# https://esphome.io/components/light
+#
 light:
   - id: backlight
     platform: monochromatic
@@ -179,6 +188,9 @@ light:
     blue: led_b
     restore_mode: ALWAYS_OFF
 
+#
+# https://esphome.io/components/sensor
+#
 sensor:
   - platform: adc
     pin: GPIO34
@@ -187,6 +199,9 @@ sensor:
     attenuation: 12db
     update_interval: 30s
 
+#
+# https://esphome.io/components/display
+#
 display:
   - platform: mipi_spi
     id: esp_display
@@ -199,24 +214,21 @@ display:
       number: GPIO2
       ignore_strapping_warning: true
     data_rate: 40MHz
-    # Confirmed on hardware: buttons render in LVGL's default blue,
-    # so this channel order is correct despite the board definition
-    # declaring BGR.
     color_order: RGB
     invert_colors: false
-    # Panel is natively 240x320 portrait. swap_xy performs the rotation
-    # via MADCTL; dimensions must match it. If the two disagree, every
-    # row overruns into the next and the image tears diagonally.
-    transform:
-      swap_xy: true
-      mirror_x: true
-      mirror_y: false
-    dimensions:
-      width: 320
-      height: 240
     auto_clear_enabled: false
     update_interval: never
+    dimensions:
+      width: 240
+      height: 320
+    transform:
+      swap_xy: false
+      mirror_x: false
+      mirror_y: false
 
+#
+# https://esphome.io/components/touchscreen
+#
 touchscreen:
   platform: xpt2046
   id: esp_touch
@@ -234,10 +246,11 @@ touchscreen:
     x_max: 3870
     y_min: 420
     y_max: 3790
-  # Must follow the display rotation above.
+  # Must follow the display rotation above. mirror_x was flipped to
+  # false because a touch at the top left was reported at the top right.
   transform:
     swap_xy: true
-    mirror_x: true
+    mirror_x: false
     mirror_y: false
   # Verification helper - remove once the mapping is confirmed.
   on_touch:
@@ -245,9 +258,16 @@ touchscreen:
         ESP_LOGI("cal", "x=%d y=%d  raw_x=%d raw_y=%d",
                  touch.x, touch.y, touch.x_raw, touch.y_raw);
 
+#
+# https://esphome.io/components/lvgl
+#
+
 # >>> LVGL Designer - generated from the canvas. >>>
 # This block is regenerated from the canvas - edits here are not preserved.
 lvgl:
+  # Panel is natively 240x320. LVGL rotates to landscape, so the canvas
+  # below is 320x240. With LVGL this must live here, not in the display.
+  rotation: 90°
   # 320x240x16bit is ~150 kB. A full-size buffer will not fit in
   # internal RAM next to WiFi/API/web_server on a board without PSRAM.
   buffer_size: 25%
