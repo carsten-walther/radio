@@ -372,13 +372,13 @@ output:
   - id: led_g
     platform: ledc
     pin:
-      number: GPIO16
+      number: GPIO17
       inverted: true
 
   - id: led_b
     platform: ledc
     pin:
-      number: GPIO17
+      number: GPIO16
       inverted: true
 
 #
