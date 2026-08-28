@@ -13,26 +13,28 @@ substitutions:
   area: Miscellaneous
 
   #
-  # I2S pins for the external DAC.
+  # The on-board amplifier's input. GPIO26 is DAC channel 1 - fixed in
+  # silicon; the only other DAC pin is GPIO25 (channel 0).
   #
-  # Free on this board once the display (14/13/12/15/2), touch (33/36),
-  # backlight (27), RGB LED (4/16/17), LDR (34) and the SD bus (5/23/18/19)
-  # have taken theirs: GPIO21, 22, 25 and 32. Three are needed, 32 stays spare.
+  # ESPHome's own i2s_audio speaker refuses the internal DAC outright
+  # ("Internal DAC is no longer supported", a hard error), because the IDF 5
+  # I2S driver dropped its built-in DAC mode. The silicon did not go anywhere:
+  # IDF 5 replaced that mode with a dedicated DMA driver, dac_continuous, and
+  # the local dac_speaker component in components/ wraps exactly that driver
+  # in the ordinary Speaker interface. So this pin drives the speaker the
+  # board was built around, no extra hardware, at the DAC's native 8 bits.
   #
-  # GPIO26 is deliberately not among them although it is now unused. It carries
-  # the ON-BOARD amplifier, which is fed by the internal DAC - and ESPHome
-  # 2026.7 rejects that outright ("Internal DAC is no longer supported", a hard
-  # error in the i2s_audio speaker's FINAL_VALIDATE_SCHEMA), so the on-board
-  # speaker cannot be driven at all. An I2S data line there would push a
-  # digital signal into an analogue amplifier input: noise, not audio.
-  #
-  # CHECK ALL THREE ARE BROKEN OUT before wiring. GPIO21 and GPIO22 sit on the
-  # CN1/P3 header on these boards; GPIO25 is the one to verify, and GPIO32 is
-  # the fallback if it is not reachable.
-  #
-  PIN_I2S_BCLK: GPIO22
-  PIN_I2S_LRCLK: GPIO21
-  PIN_I2S_DOUT: GPIO25
+  PIN_SPEAKER: GPIO26
+
+#
+# https://esphome.io/components/external_components
+#
+# The dac_speaker platform lives in components/ - see the note at PIN_SPEAKER.
+#
+external_components:
+  - source:
+      type: local
+      path: components
 
 #
 # https://esphome.io/components/esphome
@@ -156,24 +158,58 @@ api:
 # https://esphome.io/components/logger
 #
 logger:
-  level: ERROR
+  level: DEBUG
 
 #
 # https://esphome.io/components/time/sntp
 #
+#
+# Two sources, and NO selection logic between them - because there is nothing
+# to select. Both platforms call RealTimeClock::synchronize_epoch_(), which
+# sets the one system clock; now() on either id reads that same clock back.
+# Whichever syncs first sets it, and the other agrees or is ignored (a sync
+# within +/-1s of the current time is skipped as a no-op).
+#
+# So "Home Assistant, otherwise SNTP" needs no code: with no API connection
+# SNTP sets the clock, with no internet route Home Assistant does, and with
+# both the first one wins and the second changes nothing.
+#
+# The consequence worth knowing: the minute tick below sits on sntp_time but
+# does NOT depend on SNTP having worked. A cron trigger reads the system
+# clock, so it keeps ticking on a Home-Assistant-only clock just the same.
+#
 time:
-  - platform: sntp
-    id: time_id
+  - platform: homeassistant
+    id: homeassistant_time
+    # Pinned deliberately, and NOT left to Home Assistant.
+    #
+    # Without this line ESPHome defines USE_HOMEASSISTANT_TIMEZONE, and HA
+    # pushes its own zone on every connect (api_connection.cpp calls
+    # set_timezone). That is a GLOBAL setting - apply_timezone_ writes
+    # set_global_tz - so it would overwrite the Europe/Berlin below and the
+    # panel would show a different time depending on whether HA happened to be
+    # connected. A clock has to read the same either way.
+    #
+    # Drop this line if HA should be authoritative for the zone; then keep the
+    # two in step by hand.
     timezone: Europe/Berlin
+    on_time_sync:
+      then:
+        - script.execute: clock_show
+
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Berlin
+    on_time_sync:
+      then:
+        - script.execute: clock_show
+
+    # The ongoing tick, on one platform only - two would fire twice a minute
+    # for one visible change.
     on_time:
       - seconds: 0
         then:
-          - lvgl.label.update:
-              id: lbl_time
-              text: !lambda return id(time_id).now().strftime("%H:%M");
-          - lvgl.label.update:
-              id: lbl_date
-              text: !lambda return id(time_id).now().strftime("%d.%m.%Y");
+          - script.execute: clock_show
 
 # ═══════════════════════════════════════════════════════════
 #  CYD (ESP32-2432S024R)
@@ -238,6 +274,33 @@ globals:
 #
 script:
   #
+  # Puts the clock on the panel. Called from both time sources' on_time_sync -
+  # so the display fills the moment ANY source lands, rather than at the next
+  # full minute - and from the minute tick after that.
+  #
+  # now() is read from sntp_time, but that is not a preference: both platforms
+  # share the system clock, so either id returns the same value. It matters
+  # only if that id ever disappears from this file.
+  #
+  # The is_valid() guard is what keeps the placeholders honest. Callbacks also
+  # fire on a sync that changed nothing, and on_time_sync can arrive before
+  # the epoch is plausible; without it the labels would briefly show 1970.
+  #
+  - id: clock_show
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: 'return id(sntp_time).now().is_valid();'
+          then:
+            - lvgl.label.update:
+                id: lbl_time
+                text: !lambda 'return id(sntp_time).now().strftime("%H:%M");'
+            - lvgl.label.update:
+                id: lbl_date
+                text: !lambda 'return id(sntp_time).now().strftime("%d.%m.%Y");'
+
+  #
   # The one place the station list is read.
   #
   # Every button goes through here rather than reaching into the list itself,
@@ -278,39 +341,29 @@ script:
                 .set_media_url(url)
                 .set_command(media_player::MEDIA_PLAYER_COMMAND_PLAY)
                 .perform();
+            // Point the metadata poller at the same stream, and poll now
+            // rather than in up to 30s - a station change whose title lags
+            // half a minute looks like the wrong title, not a slow one.
+            id(icy_id)->set_url(url);
+            id(icy_id)->request_now();
           }
 
 #
-# https://esphome.io/components/i2s_audio
+# The local dac_speaker platform - the on-board amplifier via the internal
+# DAC. See the note at PIN_SPEAKER for why this is a local component.
 #
-# The on-board amplifier on GPIO26 cannot be used - see the pin note in
-# substitutions. This drives an external I2S DAC (MAX98357A or PCM5102).
-#
-i2s_audio:
-  - id: i2s_bus
-    i2s_bclk_pin: ${PIN_I2S_BCLK}
-    i2s_lrclk_pin: ${PIN_I2S_LRCLK}
-
-#
-# https://esphome.io/components/speaker/i2s_audio
+# The pipeline still decodes to 16-bit mono; the cut to the DAC's 8 bits and
+# the software volume happen in the speaker task, one pass per chunk.
 #
 speaker:
-  - platform: i2s_audio
+  - platform: dac_speaker
     id: radio_speaker
-    i2s_audio_id: i2s_bus
-    dac_type: external
-    i2s_dout_pin: ${PIN_I2S_DOUT}
-    sample_rate: 44100
-    bits_per_sample: 16bit
-    channel: mono
+    pin: ${PIN_SPEAKER}
 
-    # 100ms, not the 500ms default. The speaker's ring buffer is sized from
-    # this: at 44100Hz stereo 16-bit that is 176400 bytes per second, so the
-    # default asked for 88200 bytes on a board whose entire free heap is
-    # around a hundred kilobytes.
-    #
-    # The floor is 50ms (DMA_BUFFER_DURATION_MS * DMA_BUFFERS_COUNT), so there
-    # is a little room left below this if it is ever needed.
+    # The ring buffer between the pipeline and the DAC-DMA, sized from the
+    # INPUT format: 100ms at 44100Hz mono 16-bit is 8820 bytes. Small on
+    # purpose - the media_player's 32kB buffer upstream does the real
+    # smoothing, this one only has to outlast a scheduling hiccup.
     buffer_duration: 100ms
 
 #
@@ -329,7 +382,7 @@ media_player:
   - platform: speaker
     id: radio_player
     name: Radio
-    volume_initial: 60%
+    volume_initial: 50%
 
     #
     # THIS IS WHAT CAUSED "Media reader encountered an error: ESP_ERR_NO_MEM".
@@ -351,32 +404,76 @@ media_player:
     #
     buffer_size: 32768
 
-    # Playing is shown by leaving btn_play_stop CHECKED, which the theme draws
-    # in its checked colour.
+    # Both signals follow the PLAYER, not the button that was pressed: a
+    # stream that dies, or a stop sent from Home Assistant, has to move them
+    # too - and would not if the click handler flipped them.
     #
-    # Not by swapping the icon: a buttonmatrix button is a pseudo-widget with
-    # an empty modify schema, so lvgl.widget.update rejects `text` outright
-    # ("[text] is an invalid option"). The whole matrix would have to be
-    # rebuilt to change one glyph.
+    # The glyph swap only became possible when the buttonmatrix became real
+    # button widgets. A buttonmatrix button is a pseudo-widget with an empty
+    # modify schema and no label of its own, so lvgl.widget.update rejected
+    # `text` outright; a real button holds a real label, and that label has an
+    # id.
     #
-    # It follows the PLAYER, not the button that was pressed - a stream that
-    # dies, or a stop sent from Home Assistant, moves it too, which it would
-    # not if the button handler flipped it.
+    # The checked state stays alongside it. It is not redundant - the glyph
+    # says what the next press will do, the colour says what is happening now,
+    # and on a panel this size the colour reads from across the room.
     on_play:
       - lvgl.widget.update:
           id: btn_play_stop
           state:
             checked: true
+      - lvgl.label.update:
+          id: lbl_play_stop
+          text: "\uF04D"
     on_idle:
       - lvgl.widget.update:
           id: btn_play_stop
           state:
             checked: false
+      - lvgl.label.update:
+          id: lbl_play_stop
+          text: "\uF04B"
+      # Stop polling and clear title and bitrate - a silent radio showing a
+      # song name claims something that is not happening.
+      - lambda: 'id(icy_id)->set_url("");'
     announcement_pipeline:
       speaker: radio_speaker
       format: MP3
       sample_rate: 44100
       num_channels: 1
+
+#
+# Stream title and bitrate, from the ICY metadata the audio reader never asks
+# for - a local component, components/icy_info/. It opens its own short-lived
+# http connection every 30s, reads one metadata interval and hangs up; see the
+# header of that component for the trade-offs (and why https is skipped).
+#
+# The sensors are internal: they exist to feed the two labels. Clearing
+# publishes "" and NAN, which is why both lambdas guard before formatting.
+#
+icy_info:
+  id: icy_id
+  update_interval: 30s
+  stream_title:
+    id: icy_title
+    internal: True
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_rds
+            text: !lambda 'return x;'
+  bitrate:
+    id: icy_bitrate
+    internal: True
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_bitrate
+            text: !lambda |-
+              if (std::isnan(x) || x <= 0.0f) {
+                return std::string("");
+              }
+              return str_sprintf("%.0f kbit/s", x);
 
 #
 # https://esphome.io/components/output
@@ -409,10 +506,12 @@ light:
     platform: monochromatic
     output: backlight_pwm
     name: Display Backlight
+    internal: true
     restore_mode: ALWAYS_ON
   - id: status_rgb
     platform: rgb
     name: Status LED
+    internal: true
     red: led_r
     green: led_g
     blue: led_b
@@ -557,6 +656,13 @@ touchscreen:
   id: esp_touch
   spi_id: spi_bus
   cs_pin: GPIO33
+  # Boot log shows "gpio_pullup_en(85): GPIO number error (input-only pad has
+  # no internal PU)" for this pin, and it is HARMLESS. The xpt2046 driver
+  # hardcodes an internal pull-up on its IRQ line (xpt2046.cpp: FLAG_PULLUP),
+  # but GPIO34-39 physically have none - IDF refuses, logs, and everything
+  # continues. The 85 is a line number in IDF's gpio.c, not a GPIO. The board
+  # carries an external pull-up on T_IRQ, which is why touch works regardless
+  # - the calibration below was measured through exactly this wiring.
   interrupt_pin: GPIO36
   data_rate: 2MHz
   update_interval: 50ms
@@ -664,6 +770,17 @@ lvgl:
             text_align: CENTER
             long_mode: SCROLL
             text_font: montserrat_20
+
+        - label:
+            id: lbl_bitrate
+            x: 0
+            y: 110
+            width: 100%
+            text: ""
+            text_color: 0xFFFFFF
+            text_align: CENTER
+            long_mode: SCROLL
+            text_font: montserrat_14
         
         - obj:
             id: lv_obj
@@ -714,9 +831,15 @@ lvgl:
               # wrong the moment one of the others acted.
               - button:
                   id: btn_play_stop
+                  checkable: true
                   radius: 4
                   widgets:
+                    # The id is what makes the glyph swappable - see the
+                    # media_player's on_play/on_idle. It was not possible while
+                    # this was a buttonmatrix: those buttons are pseudo-widgets
+                    # with no label of their own to address.
                     - label:
+                        id: lbl_play_stop
                         align: CENTER
                         text: "\uF04B"
                   grid_cell_row_pos: 0
@@ -754,6 +877,10 @@ lvgl:
                         play: !lambda |-
                           return id(radio_player)->state == media_player::MEDIA_PLAYER_STATE_PLAYING;
 
+              # Volume, in the media player's volume_increment steps. The
+              # command lands in SpeakerMediaPlayer::set_volume_, which hands
+              # it to the speaker - the dac_speaker applies it in software on
+              # the next chunk, so it takes effect mid-playback.
               - button:
                   id: btn_vol_down
                   radius: 4
@@ -765,6 +892,9 @@ lvgl:
                   grid_cell_column_pos: 0
                   grid_cell_x_align: STRETCH
                   grid_cell_y_align: STRETCH
+                  on_click:
+                    - media_player.volume_down:
+                        id: radio_player
 
               - button:
                   id: btn_vol_up
@@ -777,6 +907,9 @@ lvgl:
                   grid_cell_column_pos: 1
                   grid_cell_x_align: STRETCH
                   grid_cell_y_align: STRETCH
+                  on_click:
+                    - media_player.volume_up:
+                        id: radio_player
 
               - button:
                   id: btn_settings
