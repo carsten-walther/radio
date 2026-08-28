@@ -736,7 +736,7 @@ lvgl:
             x: -20
             y: 0
             align: TOP_MID
-            text: "\uF8A2"
+            text: "\uF1EB"
             # Six hex digits, not seven - this read 0x4444444, which YAML
             # accepts as the integer 71581764 and LVGL then truncates to
             # something that is not the grey it looks like. Dim until the
