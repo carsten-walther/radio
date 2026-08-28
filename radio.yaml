@@ -607,6 +607,7 @@ lvgl:
             x: 0
             y: 0
             align: TOP_MID
+            hidden: true
             text: "\uF244"
             text_color: 0xFFFFFF
             text_font: montserrat_14
@@ -630,16 +631,14 @@ lvgl:
               - 0, 0
               - 100%, 0
             line_width: 1
-            line_color: 0xDDDDDD
+            line_color: 0xB3B3B3
 
         - label:
             id: lbl_ip
             x: 0
             y: 20
             align: TOP_MID
-            # What is on screen from boot until the first lease. It was
-            # 127.0.0.1, which is a real address and reads as one - a device
-            # that never got on the network would have looked like it had.
+            hidden: true
             text: "---.---.---.---"
             text_color: 0xFFFFFF
             text_font: montserrat_14
@@ -667,7 +666,7 @@ lvgl:
             text_font: montserrat_20
         
         - obj:
-            id: lv_obj_11
+            id: lv_obj
             x: 0
             y: 0
             width: 100%
@@ -781,6 +780,7 @@ lvgl:
 
               - button:
                   id: btn_settings
+                  bg_color: 0x204EF3
                   radius: 4
                   widgets:
                     - label:
