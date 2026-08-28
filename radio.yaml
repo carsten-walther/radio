@@ -109,6 +109,9 @@ wifi:
       - lvgl.label.update:
           id: lbl_ip
           text: "---.---.---.---"
+      - lvgl.widget.update:
+          id: lbl_connected
+          text_color: 0x444444
 
 #
 # https://esphome.io/components/captive_portal
@@ -549,6 +552,25 @@ text_sensor:
               text: !lambda |-
                 return (x.empty() || x == "0.0.0.0") ? "---.---.---.---" : x;
 
+          # The icon rides the same event as the address, and reads the same
+          # way: white once there is a usable connection, dim otherwise.
+          # Driving both from one event is what keeps them from disagreeing -
+          # an icon claiming "connected" beside a row of dashes would be worse
+          # than no icon at all.
+          #
+          # "Connected" here means LEASED, not associated: this fires on
+          # IP_EVENT_STA_GOT_IP. An access point that answers but hands out no
+          # address leaves the icon dim, which is the honest reading - nothing
+          # on this device works without an address.
+          - lvgl.widget.update:
+              id: lbl_connected
+              # lv_color_hex(), not a bare 0x...: a literal in the YAML is
+              # converted by the code generator, but a lambda has to hand back
+              # an lv_color_t itself ("could not convert 'int' to
+              # 'lv_color_t'").
+              text_color: !lambda |-
+                return lv_color_hex((x.empty() || x == "0.0.0.0") ? 0x444444 : 0xFFFFFF);
+
 #
 # https://esphome.io/components/sensor
 #
@@ -589,6 +611,7 @@ sensor:
   - platform: adc
     pin: GPIO34
     name: Ambient Light
+    internal: true
     id: ambient_light
     attenuation: 12db
     update_interval: 30s
@@ -709,8 +732,21 @@ lvgl:
             text_font: montserrat_14
 
         - label:
+            id: lbl_connected
+            x: -20
+            y: 0
+            align: TOP_MID
+            text: "\uF8A2"
+            # Six hex digits, not seven - this read 0x4444444, which YAML
+            # accepts as the integer 71581764 and LVGL then truncates to
+            # something that is not the grey it looks like. Dim until the
+            # network is actually up; see the wifi_info sensor.
+            text_color: 0x444444
+            text_font: montserrat_14
+
+        - label:
             id: lbl_battery
-            x: 0
+            x: 20
             y: 0
             align: TOP_MID
             hidden: true
