@@ -13,9 +13,13 @@
 #include "esphome/components/sensor/sensor.h"
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/core/component.h"
+#include "esphome/core/hal.h"
 
 namespace esphome {
 namespace icy_info {
+
+/// How long request_now() stands back from a station change before polling.
+static const uint32_t REQUEST_DELAY_MS = 5000;
 
 //
 // Polls a SHOUTcast/Icecast stream for its ICY metadata - see __init__.py for
@@ -37,21 +41,31 @@ class IcyInfo : public PollingComponent {
 
   void set_title_sensor(text_sensor::TextSensor *sensor) { this->title_sensor_ = sensor; }
   void set_bitrate_sensor(sensor::Sensor *sensor) { this->bitrate_sensor_ = sensor; }
+  void set_name_sensor(text_sensor::TextSensor *sensor) { this->name_sensor_ = sensor; }
 
   /// The stream to poll. An empty string stops polling and clears both
   /// sensors - the YAML calls this on every station change and on stop.
   void set_url(const std::string &url);
 
-  /// Poll immediately instead of waiting out the current interval - called on
-  /// station change so the title does not lag the music by half a minute.
-  void request_now() { this->request_now_ = true; }
+  /// Poll soon rather than at the next interval - called on station change so
+  /// the title does not lag the music by half a minute.
+  ///
+  /// Soon, not now: a station change is the one moment the audio pipeline
+  /// allocates everything it needs, and this poll wants a 4kB task stack and
+  /// an HTTP client at the same instant. Standing back a few seconds keeps
+  /// the metadata prompt without competing for the heap that has to carry the
+  /// audio.
+  void request_now() { this->request_after_ms_ = millis() + REQUEST_DELAY_MS; }
 
  protected:
   static void fetch_task(void *params);
   void run_fetch_();
+  /// One attempt against one URL; true if anything usable came back.
+  bool try_fetch_(const std::string &url);
 
   text_sensor::TextSensor *title_sensor_{nullptr};
   sensor::Sensor *bitrate_sensor_{nullptr};
+  text_sensor::TextSensor *name_sensor_{nullptr};
 
   SemaphoreHandle_t mutex_{nullptr};
   TaskHandle_t task_handle_{nullptr};
@@ -60,11 +74,13 @@ class IcyInfo : public PollingComponent {
   // written by the task and consumed by loop().
   std::string url_;
   std::string fetched_title_;
+  std::string fetched_name_;
   int fetched_bitrate_{-1};
   bool dirty_{false};
 
   bool clear_pending_{false};
-  bool request_now_{false};
+  /// millis() at which a deferred poll becomes due; 0 means none pending.
+  uint32_t request_after_ms_{0};
 };
 
 }  // namespace icy_info

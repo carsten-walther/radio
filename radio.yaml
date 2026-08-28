@@ -72,6 +72,20 @@ esp32:
   framework:
     type: esp-idf
 
+    advanced:
+      # +40kB of RAM, and the boot log asks for it by name ("Bootloader
+      # supports SRAM1 as IRAM"). SRAM1 is normally left to the bootloader;
+      # handing it to IRAM frees the equivalent amount of DRAM for the heap,
+      # which on this device is the whole problem - the audio pipeline was
+      # aborting on allocations with 148kB free at rest.
+      sram1_as_iram: true
+
+      # This board reports rev3.1 at boot and the log suggests it: telling the
+      # build so drops the compatibility code for older silicon. Flash only,
+      # no effect on RAM - but free.
+      minimum_chip_revision: "3.1"
+
+
 #
 # https://esphome.io/components/esphome#preferences
 #
@@ -255,9 +269,9 @@ globals:
     restore_value: no
     initial_value: |-
       {
-        "Klassik Radio|http://live.streams.klassikradio.de/klassikradio-deutschland/stream/mp3",
-        "Toggo Radio|http://radio.toggo.de/live/mp3-128/airable",
-        "BEATS Radio|http://stream.klassikradio.de/beats/mp3",
+        "Klassik Radio|https://live.streams.klassikradio.de/klassikradio-deutschland/stream/mp3",
+        "Toggo Radio|https://radio.toggo.de/live/mp3-128/airable",
+        "BEATS Radio|https://stream.klassikradio.de/beats/mp3",
         "80s80s|https://streams.80s80s.de/web/mp3-192/streams.80s80s.de/",
         "90s90s|https://streams.90s90s.de/90s00s/mp3-192/streams.90s90s.de/"
       }
@@ -363,11 +377,14 @@ speaker:
     id: radio_speaker
     pin: ${PIN_SPEAKER}
 
-    # The ring buffer between the pipeline and the DAC-DMA, sized from the
-    # INPUT format: 100ms at 44100Hz mono 16-bit is 8820 bytes. Small on
-    # purpose - the media_player's 32kB buffer upstream does the real
+    # 50ms. The buffer holds INPUT-format audio, and the pipeline delivers
+    # stereo (it has no resampler, so the mono the speaker asks for is a
+    # preference nobody acts on) - 50ms at 44100Hz stereo 16-bit is 8820
+    # bytes, where 100ms was 17640.
+    #
+    # Small on purpose: the media_player's 16kB buffer upstream does the real
     # smoothing, this one only has to outlast a scheduling hiccup.
-    buffer_duration: 100ms
+    buffer_duration: 50ms
 
 #
 # https://esphome.io/components/media_player/speaker
@@ -397,15 +414,21 @@ media_player:
     # allocation cannot ever succeed here. The default is written for boards
     # that have PSRAM.
     #
-    # 32kB holds about two seconds of a 128kbit/s stream. It also sets the
-    # transfer buffers, which are min(buffer_size / 4, 24kB) each and are
-    # allocated three times over - once in the reader, twice in the decoder -
-    # so this line is worth 32 + 8 + 16 = 56kB rather than the 32 it names.
+    # 16kB, down from 32kB. Measured on the device: 148kB free at rest, under
+    # 11kB while playing - so everything downstream of this was failing to
+    # allocate, including the speaker task and the metadata poller's HTTP
+    # client.
     #
-    # If playback stutters on a weak signal, raise this before anything else,
-    # and watch Heap Free while you do.
+    # The line is worth four times what it names. It also sets the transfer
+    # buffers, min(buffer_size / 4, 24kB) each, allocated three times over -
+    # once in the reader, twice in the decoder. At 32kB that was 32 + 3x8 =
+    # 56kB; at 16kB it is 16 + 3x4 = 28kB.
     #
-    buffer_size: 32768
+    # The cost is buffer depth: about one second of a 128kbit/s stream instead
+    # of two. Raise it again if playback stutters on a weak signal, and watch
+    # Heap Free while you do.
+    #
+    buffer_size: 16384
 
     # Both signals follow the PLAYER, not the button that was pressed: a
     # stream that dies, or a stop sent from Home Assistant, has to move them
@@ -420,19 +443,22 @@ media_player:
     # The checked state stays alongside it. It is not redundant - the glyph
     # says what the next press will do, the colour says what is happening now,
     # and on a panel this size the colour reads from across the room.
+    #
+    # BOTH on_play and on_announcement, and on_announcement is the one that
+    # actually fires here. With only an announcement_pipeline the player runs
+    # in single-pipeline mode and reports MEDIA_PLAYER_STATE_ANNOUNCING, never
+    # PLAYING - so an icon hung on on_play alone never changed. on_play is kept
+    # for the day a media_pipeline is added.
+    #
     on_play:
-      - lvgl.widget.update:
-          id: btn_play_stop
-          state:
-            checked: true
+      - lvgl.label.update:
+          id: lbl_play_stop
+          text: "\uF04D"
+    on_announcement:
       - lvgl.label.update:
           id: lbl_play_stop
           text: "\uF04D"
     on_idle:
-      - lvgl.widget.update:
-          id: btn_play_stop
-          state:
-            checked: false
       - lvgl.label.update:
           id: lbl_play_stop
           text: "\uF04B"
@@ -456,7 +482,23 @@ media_player:
 #
 icy_info:
   id: icy_id
-  update_interval: 30s
+  update_interval: 10s
+  # The station's own name, from the icy-name header. It overwrites the name
+  # from the stations list as soon as it arrives.
+  #
+  # The list name is not redundant: it is on the panel instantly and on every
+  # station, including while stopped and while browsing with btn_back/btn_next,
+  # where no stream is open to ask. This replaces it with the authoritative one
+  # a second or two later.
+  station_name:
+    id: icy_name
+    internal: True
+    on_value:
+      then:
+        - lvgl.label.update:
+            id: lbl_station
+            text: !lambda 'return x;'
+
   stream_title:
     id: icy_title
     internal: True
@@ -622,6 +664,15 @@ sensor:
 media_source:
   - platform: audio_http
     id: http_source
+    # 16kB, down from the 50000 default. It is allocated as one ring buffer
+    # plus a transfer buffer of min(24kB, half of this), so the default was
+    # asking for ~75kB on a device that has about 148kB in total.
+    #
+    # Note this path is NOT what plays the stations: station_apply calls
+    # set_media_url with a plain http URL, which the media_player's own
+    # pipeline reads (the "ann_read" ring buffer in the log). This source only
+    # serves media-source:// URIs, i.e. playback started from Home Assistant.
+    buffer_size: 16000
 
 #
 # https://esphome.io/components/display
@@ -810,7 +861,7 @@ lvgl:
         - label:
             id: lbl_bitrate
             x: 0
-            y: 110
+            y: 120
             width: 100%
             text: ""
             text_color: 0xFFFFFF
@@ -857,7 +908,9 @@ lvgl:
                     - script.execute:
                         id: station_apply
                         play: !lambda |-
-                          return id(radio_player)->state == media_player::MEDIA_PLAYER_STATE_PLAYING;
+                          const auto s = id(radio_player)->state;
+                          return s == media_player::MEDIA_PLAYER_STATE_PLAYING ||
+                                 s == media_player::MEDIA_PLAYER_STATE_ANNOUNCING;
               
               # Play the selected station, or stop what is running.
               #
@@ -867,7 +920,6 @@ lvgl:
               # wrong the moment one of the others acted.
               - button:
                   id: btn_play_stop
-                  checkable: true
                   radius: 4
                   widgets:
                     # The id is what makes the glyph swappable - see the
@@ -885,8 +937,15 @@ lvgl:
                   on_click:
                     - if:
                         condition:
+                          # ANNOUNCING as well as PLAYING - this player only
+                          # has an announcement pipeline, so it reports
+                          # ANNOUNCING while a station is running and this
+                          # button did nothing but restart the stream while it
+                          # only tested for PLAYING.
                           lambda: |-
-                            return id(radio_player)->state == media_player::MEDIA_PLAYER_STATE_PLAYING;
+                            const auto s = id(radio_player)->state;
+                            return s == media_player::MEDIA_PLAYER_STATE_PLAYING ||
+                                   s == media_player::MEDIA_PLAYER_STATE_ANNOUNCING;
                         then:
                           - media_player.stop:
                               id: radio_player
@@ -911,7 +970,9 @@ lvgl:
                     - script.execute:
                         id: station_apply
                         play: !lambda |-
-                          return id(radio_player)->state == media_player::MEDIA_PLAYER_STATE_PLAYING;
+                          const auto s = id(radio_player)->state;
+                          return s == media_player::MEDIA_PLAYER_STATE_PLAYING ||
+                                 s == media_player::MEDIA_PLAYER_STATE_ANNOUNCING;
 
               # Volume, in the media player's volume_increment steps. The
               # command lands in SpeakerMediaPlayer::set_volume_, which hands

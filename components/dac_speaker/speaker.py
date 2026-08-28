@@ -1,7 +1,7 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome import pins
-from esphome.components import esp32, speaker
+from esphome.components import audio, esp32, speaker
 from esphome.components.esp32.const import VARIANT_ESP32
 from esphome.const import CONF_ID, CONF_PIN
 
@@ -13,6 +13,35 @@ CONF_BUFFER_DURATION = "buffer_duration"
 
 dac_speaker_ns = cg.esphome_ns.namespace("dac_speaker")
 DacSpeaker = dac_speaker_ns.class_("DacSpeaker", speaker.Speaker, cg.Component)
+
+
+def _declare_stream_limits(config):
+    """Tell the pipeline what this speaker accepts.
+
+    Note what this does NOT do: it does not make anything convert. The speaker
+    media_player's pipeline has no resampler - these limits are validated
+    against the pipeline's declared preferred format and nothing more, so a
+    stereo MP3 still arrives here as stereo and the speaker task downmixes it
+    itself. Declaring 1..1 channels would therefore be a claim the runtime
+    quietly disproves; 1..2 is the truth, and the task handles both.
+
+    16 bits both ways because that is what the pipeline produces; the cut to
+    the DAC's 8 is done in the speaker task, not asked for here.
+
+    The sample-rate floor is the DAC-DMA's own: below 19.6 kHz the driver
+    rejects the frequency outright with the default digital clock.
+    """
+    # set_stream_limits' validator mutates the config in place and returns
+    # None, so the result must not be passed on as this validator's own.
+    audio.set_stream_limits(
+        min_bits_per_sample=16,
+        max_bits_per_sample=16,
+        min_channels=1,
+        max_channels=2,
+        min_sample_rate=19600,
+        max_sample_rate=48000,
+    )(config)
+    return config
 
 
 def _only_classic_esp32(config):
@@ -38,6 +67,7 @@ CONFIG_SCHEMA = cv.All(
             ): cv.positive_time_period_milliseconds,
         }
     ).extend(cv.COMPONENT_SCHEMA),
+    _declare_stream_limits,
     _only_classic_esp32,
 )
 

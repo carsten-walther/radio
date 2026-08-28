@@ -33,6 +33,7 @@ DEPENDENCIES = ["esp32", "network"]
 
 CONF_STREAM_TITLE = "stream_title"
 CONF_BITRATE = "bitrate"
+CONF_STATION_NAME = "station_name"
 
 icy_info_ns = cg.esphome_ns.namespace("icy_info")
 IcyInfo = icy_info_ns.class_("IcyInfo", cg.PollingComponent)
@@ -41,6 +42,7 @@ CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(IcyInfo),
         cv.Optional(CONF_STREAM_TITLE): text_sensor.text_sensor_schema(),
+        cv.Optional(CONF_STATION_NAME): text_sensor.text_sensor_schema(),
         cv.Optional(CONF_BITRATE): sensor.sensor_schema(
             unit_of_measurement="kbit/s",
             accuracy_decimals=0,
@@ -57,6 +59,10 @@ async def to_code(config):
     if title_config := config.get(CONF_STREAM_TITLE):
         sens = await text_sensor.new_text_sensor(title_config)
         cg.add(var.set_title_sensor(sens))
+
+    if name_config := config.get(CONF_STATION_NAME):
+        sens = await text_sensor.new_text_sensor(name_config)
+        cg.add(var.set_name_sensor(sens))
 
     if bitrate_config := config.get(CONF_BITRATE):
         sens = await sensor.new_sensor(bitrate_config)

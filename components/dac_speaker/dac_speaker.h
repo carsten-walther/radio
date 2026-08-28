@@ -57,6 +57,10 @@ class DacSpeaker : public speaker::Speaker, public Component {
  protected:
   static void speaker_task(void *params);
   void run_();
+  /// Creates the DAC on first use and keeps it across stop/start, rebuilding
+  /// only when the sample rate changes.
+  esp_err_t ensure_dac_(uint32_t sample_rate);
+  void release_dac_();
 
   uint8_t dac_channel_{1};
   uint32_t buffer_duration_ms_{100};
@@ -64,16 +68,19 @@ class DacSpeaker : public speaker::Speaker, public Component {
   EventGroupHandle_t event_group_{nullptr};
   TaskHandle_t task_handle_{nullptr};
 
-  /// Earliest millis() at which start() may try again after a failure.
-  ///
-  /// Without it a failed start is retried on every play(), which the decoder
-  /// calls every ~20ms - so one exhausted heap produced a permanent error
-  /// storm that burned the CPU and log bandwidth needed to recover from it.
-  uint32_t retry_after_ms_{0};
+  /// Kept across stop/start; see ensure_dac_(). Only the task touches it.
+  dac_continuous_handle_t dac_handle_{nullptr};
+  uint32_t dac_rate_{0};
 
-  /// Owned by the task while running; play() and has_buffered_data() take
-  /// copies. Same arrangement as the i2s_audio speaker.
-  std::shared_ptr<ring_buffer::RingBuffer> ring_buffer_;
+  //
+  // All allocated once in setup() and never released. play() writes into the
+  // ring buffer from the decoder task while the speaker task reads it - a
+  // RingBuffer is safe for that single-producer/single-consumer pair, and
+  // neither side can now find it missing halfway through a station change.
+  //
+  std::unique_ptr<uint8_t[]> in_;
+  std::unique_ptr<uint8_t[]> out_;
+  std::unique_ptr<ring_buffer::RingBuffer> ring_buffer_;
 };
 
 }  // namespace dac_speaker
