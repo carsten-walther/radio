@@ -64,6 +64,13 @@ class DacSpeaker : public speaker::Speaker, public Component {
   EventGroupHandle_t event_group_{nullptr};
   TaskHandle_t task_handle_{nullptr};
 
+  /// Earliest millis() at which start() may try again after a failure.
+  ///
+  /// Without it a failed start is retried on every play(), which the decoder
+  /// calls every ~20ms - so one exhausted heap produced a permanent error
+  /// storm that burned the CPU and log bandwidth needed to recover from it.
+  uint32_t retry_after_ms_{0};
+
   /// Owned by the task while running; play() and has_buffered_data() take
   /// copies. Same arrangement as the i2s_audio speaker.
   std::shared_ptr<ring_buffer::RingBuffer> ring_buffer_;

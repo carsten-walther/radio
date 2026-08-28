@@ -339,11 +339,11 @@ script:
           lv_label_set_text(id(lbl_station), name.c_str());
 
           if (play && !url.empty()) {
-            id(radio_player)
-                ->make_call()
-                .set_media_url(url)
-                .set_command(media_player::MEDIA_PLAYER_COMMAND_PLAY)
-                .perform();
+            // set_media_url alone. Adding a PLAY command on top logged
+            // "Setting both command and media_url is not needed" on every
+            // station change - MediaPlayerCall::validate_() drops the command
+            // itself, because a URL already means play.
+            id(radio_player)->make_call().set_media_url(url).perform();
             // Point the metadata poller at the same stream, and poll now
             // rather than in up to 30s - a station change whose title lags
             // half a minute looks like the wrong title, not a slow one.

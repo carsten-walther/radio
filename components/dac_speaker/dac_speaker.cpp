@@ -20,6 +20,23 @@ static const uint32_t COMMAND_STOP_GRACEFULLY = 1 << 1;
 // quickly and rarely enough not to matter.
 static const size_t CHUNK_BYTES = 1024;
 
+// How long start() stays quiet after a failure. Long enough that a device out
+// of memory logs once a second instead of fifty times, short enough that a
+// transient shortage recovers on its own.
+static const uint32_t RETRY_BACKOFF_MS = 1000;
+
+// The DAC's DMA ring. These buffers come from MALLOC_CAP_INTERNAL |
+// MALLOC_CAP_DMA - a far smaller pool than the general heap - so this is sized
+// to be frugal rather than comfortable: 3 x 1024 is 3kB, where the 4 x 2048
+// this started with wanted 8kB and failed with ESP_ERR_NO_MEM the moment the
+// audio pipeline had taken its share.
+//
+// At 44100Hz mono 8-bit each buffer is 23ms of audio, so the DMA holds ~70ms
+// and its interrupt fires every 23ms. Raise desc_num first if playback ever
+// crackles under load; the driver requires at least 2.
+static const uint32_t DAC_DESC_NUM = 3;
+static const size_t DAC_BUF_SIZE = 1024;
+
 void DacSpeaker::setup() {
   this->event_group_ = xEventGroupCreate();
   if (this->event_group_ == nullptr) {
@@ -38,6 +55,11 @@ void DacSpeaker::start() {
   if (this->is_failed() || this->state_ == speaker::STATE_RUNNING || this->state_ == speaker::STATE_STARTING)
     return;
 
+  // Silent while backing off. play() calls start() on every chunk it cannot
+  // place, so without this one failure becomes an unbounded error storm.
+  if (millis() < this->retry_after_ms_)
+    return;
+
   // STARTING before the task exists, so a caller polling is_stopped() between
   // here and the task's first instruction cannot conclude the speaker is idle.
   this->state_ = speaker::STATE_STARTING;
@@ -45,7 +67,8 @@ void DacSpeaker::start() {
 
   xTaskCreate(DacSpeaker::speaker_task, "dac_spk", 4096, this, 19, &this->task_handle_);
   if (this->task_handle_ == nullptr) {
-    ESP_LOGE(TAG, "Failed to create speaker task");
+    ESP_LOGE(TAG, "Out of memory creating the speaker task; retrying in %" PRIu32 "ms", RETRY_BACKOFF_MS);
+    this->retry_after_ms_ = millis() + RETRY_BACKOFF_MS;
     this->state_ = speaker::STATE_STOPPED;
   }
 }
@@ -119,8 +142,8 @@ void DacSpeaker::run_() {
 
   dac_continuous_config_t cfg = {};
   cfg.chan_mask = this->dac_channel_ == 1 ? DAC_CHANNEL_MASK_CH1 : DAC_CHANNEL_MASK_CH0;
-  cfg.desc_num = 4;
-  cfg.buf_size = 2048;
+  cfg.desc_num = DAC_DESC_NUM;
+  cfg.buf_size = DAC_BUF_SIZE;
   cfg.freq_hz = sample_rate;
   cfg.offset = 0;
   cfg.clk_src = DAC_DIGI_CLK_SRC_DEFAULT;
@@ -137,6 +160,7 @@ void DacSpeaker::run_() {
   }
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "DAC driver setup failed: %s", esp_err_to_name(err));
+    this->retry_after_ms_ = millis() + RETRY_BACKOFF_MS;
     this->state_ = speaker::STATE_STOPPED;
     return;
   }
@@ -151,11 +175,13 @@ void DacSpeaker::run_() {
     ESP_LOGE(TAG, "Failed to allocate audio buffers");
     dac_continuous_disable(handle);
     dac_continuous_del_channels(handle);
+    this->retry_after_ms_ = millis() + RETRY_BACKOFF_MS;
     this->state_ = speaker::STATE_STOPPED;
     return;
   }
 
   this->ring_buffer_ = std::move(rb);
+  this->retry_after_ms_ = 0;
   this->state_ = speaker::STATE_RUNNING;
 
   // Bytes at the front of `in` carried over from the previous iteration
