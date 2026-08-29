@@ -63,6 +63,28 @@ esphome:
             id: station_apply
             play: false
 
+    #
+    # The splash screen comes DOWN here; nothing puts it up. canvas_splash is
+    # the first entry in lvgl's pages:, so LVGL shows it from the first frame
+    # it ever draws - earlier than any automation could, and without a frame
+    # of canvas_main flashing past first.
+    #
+    # Priority -100 for the same reason as above: lvgl has to exist before a
+    # page action can name one of its pages.
+    #
+    # The three seconds start at the end of setup rather than at power-on, so
+    # they are three seconds of the splash being VISIBLE. Counting from the
+    # reset vector would have handed most of them to the boot log.
+    #
+    # This lives out here rather than in the lvgl: block on purpose - that
+    # block is regenerated from the designer, and the timing is not something
+    # to lose with it.
+    #
+    - priority: -100
+      then:
+        - delay: 3s
+        - lvgl.page.show: canvas_main
+
 #
 # https://esphome.io/components/esp32
 #
@@ -1043,8 +1065,16 @@ lvgl:
       scrollable: false
       scrollbar_mode: "OFF"
       widgets:
+        # Own ids, NOT lbl_station_name/lbl_stream_title. Those two live on
+        # canvas_main and are written by station_apply and icy_info; a second
+        # widget under the same id is rejected outright ("ID redefined"), and
+        # even if it were not, id() resolves to one widget - the station name
+        # would have gone to whichever of the two won.
+        #
+        # These two are never written at all: substitutions are resolved at
+        # build time, so the text is fixed in the image.
         - label:
-            id: lbl_station_name
+            id: lbl_splash_name
             x: 0
             y: 50
             width: 100%
@@ -1055,7 +1085,7 @@ lvgl:
             text_font: montserrat_28
 
         - label:
-            id: lbl_stream_title
+            id: lbl_splash_version
             x: 0
             y: 90
             width: 100%
