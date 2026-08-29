@@ -83,7 +83,38 @@ esphome:
     - priority: -100
       then:
         - delay: 3s
-        - lvgl.page.show: canvas_main
+
+        #
+        # FADE_IN is a real crossfade: LVGL animates the opacity of
+        # canvas_main from 0 while canvas_splash stays underneath, so for half
+        # a second both are on screen at once.
+        #
+        # THAT COSTS HEAP, and on this board that has to be checked rather
+        # than assumed. A screen with opa < 255 and children is drawn through
+        # a SIMPLE layer, and lv_refr.c allocates a buffer for it - but not
+        # for the whole screen: the area is clipped to the strip being
+        # refreshed and then subdivided so a slice fits in
+        # LV_DRAW_LAYER_SIMPLE_BUF_SIZE, which is 24kB here (the default; this
+        # build does not override it). So the peak extra allocation is one
+        # 24kB slice at a time, taken from the ordinary heap
+        # (LV_USE_STDLIB_MALLOC is LV_STDLIB_CUSTOM) and released again as
+        # the fade walks down the screen.
+        #
+        # 24kB is affordable HERE and only here: this runs three seconds after
+        # boot, with nothing playing - station_apply was called with
+        # play: false above. The same animation on a page change while a
+        # stream runs would be asking for 24kB at the worst possible moment.
+        # If it ever fails, LVGL logs "Allocating layer buffer failed. Try
+        # later" and retries on the next frame rather than crashing.
+        #
+        # 500ms: long enough to read as a fade, short enough that the slower
+        # frame rate during it (every frame is composited twice) is not
+        # noticeable on a screen nobody is touching yet.
+        #
+        - lvgl.page.show:
+            id: canvas_main
+            animation: FADE_IN
+            time: 500ms
 
 #
 # https://esphome.io/components/esp32
