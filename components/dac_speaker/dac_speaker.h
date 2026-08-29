@@ -10,6 +10,7 @@
 
 #include <driver/dac_continuous.h>
 
+#include <atomic>
 #include <memory>
 
 #include "esphome/components/ring_buffer/ring_buffer.h"
@@ -48,6 +49,21 @@ class DacSpeaker : public speaker::Speaker, public Component {
   size_t play(const uint8_t *data, size_t length, TickType_t ticks_to_wait) override;
   size_t play(const uint8_t *data, size_t length) override { return this->play(data, length, 0); }
 
+  //
+  // The meter tap. Returns the loudest chunk RMS seen on one channel since
+  // the last call, 0.0f..1.0f of full scale, and clears it - so a caller on a
+  // 100ms interval gets the loudest of the ~8 chunks that fell in between
+  // rather than whichever one happened to be last.
+  //
+  // Measured BEFORE the volume multiply on purpose. This is the level of what
+  // the station is sending, not of what the amplifier is doing with it: a
+  // meter that empties when the knob goes down says nothing about the
+  // programme, and at half volume it would never reach past half scale.
+  //
+  // channel: 0 = left, 1 = right. Mono input reports the same value on both.
+  //
+  float pop_level(uint8_t channel);
+
   void start() override;
   void stop() override;
   void finish() override;
@@ -56,6 +72,8 @@ class DacSpeaker : public speaker::Speaker, public Component {
 
  protected:
   static void speaker_task(void *params);
+  /// Keeps the louder of this chunk's RMS and whatever has not been read yet.
+  void report_level_(uint8_t channel, uint64_t sum_squares, size_t frames);
   void run_();
   /// Creates the DAC on first use and keeps it across stop/start, rebuilding
   /// only when the sample rate changes.
@@ -81,6 +99,17 @@ class DacSpeaker : public speaker::Speaker, public Component {
   std::unique_ptr<uint8_t[]> in_;
   std::unique_ptr<uint8_t[]> out_;
   std::unique_ptr<ring_buffer::RingBuffer> ring_buffer_;
+
+  //
+  // Written by the speaker task, cleared by whoever reads them. Relaxed
+  // ordering is enough: these are two independent 16-bit values that exist to
+  // be looked at, and nothing else is ordered against them.
+  //
+  // The one race left is benign and deliberate: a reader clearing between the
+  // task's load and store drops a single chunk's peak - 12ms of meter, once,
+  // and only when both happen in the same microsecond.
+  //
+  std::atomic<uint16_t> level_[2]{};
 };
 
 }  // namespace dac_speaker

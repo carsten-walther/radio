@@ -54,7 +54,7 @@ esphome:
   # from a power cut should not start making noise on its own.
   #
   # Priority -100 so it runs after everything is up; lvgl is a component like
-  # any other and lbl_station has to exist before a label call reaches it.
+  # any other and lbl_station_name has to exist before a label call reaches it.
   #
   on_boot:
     - priority: -100
@@ -71,6 +71,68 @@ esp32:
   cpu_frequency: 240MHZ
   framework:
     type: esp-idf
+
+    #
+    # THIS IS WHAT CAUSED "Decoder encountered an error: ESP_ERR_NO_MEM"
+    # and, one attempt later, "MP3 decoder failed: -2".
+    #
+    # Both are the same failure. -2 is micro_mp3::MP3_ALLOCATION_FAILED, and
+    # the NO_MEM is AudioDecoder::start() finding its 4kB transfer buffer was
+    # never allocated. Neither says anything about the stream: the heap simply
+    # had nothing left to give when play was pressed.
+    #
+    # What took it is ESPHome, not this config. speaker/media_player calls
+    # network.require_high_performance_networking(), and wifi/__init__.py and
+    # network/__init__.py answer it with a profile written for boards that have
+    # PSRAM - applied here unconditionally, because "PSRAM not guaranteed"
+    # still means "apply the optimized settings", only slightly smaller ones.
+    # Read them out of the generated sdkconfig.radio and they are:
+    #
+    #   CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16   (IDF default 10)
+    #   CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=64  (IDF default 32)
+    #   CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=64  (IDF default 32)
+    #   CONFIG_ESP_WIFI_RX_BA_WIN=32              (IDF default 6)
+    #   CONFIG_ESP_WIFI_TX_BA_WIN=32              (IDF default 6)
+    #   CONFIG_LWIP_TCP_WND_DEFAULT=65534         (IDF default 5744)
+    #   CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65534     (IDF default 5744)
+    #
+    # The static RX buffers alone are 16 x 1600B = 25kB of DRAM held forever.
+    # The 64kB TCP window is worse, because it is PER SOCKET: lwIP will queue
+    # up to 64kB of received segments in the heap for the audio stream, and
+    # again for the Home Assistant connection, and there are twelve sockets.
+    # A radio stream pulling flat out is exactly the workload that fills it.
+    # That is why the failure needs Home Assistant to be connected and a
+    # stream to be running before it shows up.
+    #
+    # These values are set from the components' own to_code (wifi at priority
+    # COMMUNICATION=60, network at NETWORK=201), and sdkconfig_options here is
+    # applied by the esp32 component at priority COMPONENT=0 - last, so it
+    # wins. That ordering is the only reason this block works at all.
+    #
+    # Back to roughly IDF defaults. 192kbit/s is 24kB/s; none of these numbers
+    # is anywhere near the limiting factor for that, and the ~40kB they give
+    # back is what the decoder needs.
+    #
+    sdkconfig_options:
+      CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM: "8"
+      CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM: "16"
+      CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM: "16"
+      CONFIG_ESP_WIFI_RX_BA_WIN: "6"
+      CONFIG_ESP_WIFI_TX_BA_WIN: "6"
+
+      # 8 x MSS(1440). Keep it a multiple of the MSS - lwIP rounds down, and a
+      # window that is not a whole number of segments only wastes the tail.
+      CONFIG_LWIP_TCP_WND_DEFAULT: "11520"
+      CONFIG_LWIP_TCP_SND_BUF_DEFAULT: "5760"
+      CONFIG_LWIP_TCP_RECVMBOX_SIZE: "16"
+      CONFIG_LWIP_TCPIP_RECVMBOX_SIZE: "32"
+
+      # The stations below are plain http, so nothing routine goes through
+      # mbedTLS any more - but Home Assistant can still hand this player an
+      # https URL, and a TLS session with a 16kB input record buffer is another
+      # ~20kB on top of the handshake. DYNAMIC_BUFFER releases those buffers
+      # between records instead of holding them for the life of the socket.
+      CONFIG_MBEDTLS_DYNAMIC_BUFFER: "y"
 
     advanced:
       # +40kB of RAM, and the boot log asks for it by name ("Bootloader
@@ -175,7 +237,7 @@ api:
 # https://esphome.io/components/logger
 #
 logger:
-  level: DEBUG
+  level: ERROR
 
 #
 # https://esphome.io/components/time/sntp
@@ -264,16 +326,29 @@ globals:
   # It lives here rather than in substitutions: because a substitution can only
   # hold a string - see the note up there.
   #
+  # http, not https, and deliberately. All five hosts answer on plain http and
+  # redirect to a plain-http streamabc endpoint, which the audio reader follows
+  # (esp_http_client, disable_auto_redirect=false). Over https the same play
+  # costs a TLS session for the redirect AND one for the stream - tens of kB of
+  # mbedTLS heap at exactly the moment the MP3 decoder wants its ~30kB, on a
+  # board with no PSRAM. The seven-second gap between ANNOUNCING and the ring
+  # buffer in the log was that handshake.
+  #
+  # It also makes the station list agree with icy_info, which is http-only for
+  # the same reason - see the header of that component.
+  #
+  # Nothing here is worth encrypting: these are public streams, and the URLs
+  # are in the firmware image anyway.
   - id: stations
     type: std::vector<std::string>
     restore_value: no
     initial_value: |-
       {
-        "Klassik Radio|https://live.streams.klassikradio.de/klassikradio-deutschland/stream/mp3",
-        "Toggo Radio|https://radio.toggo.de/live/mp3-128/airable",
-        "BEATS Radio|https://stream.klassikradio.de/beats/mp3",
-        "80s80s|https://streams.80s80s.de/web/mp3-192/streams.80s80s.de/",
-        "90s90s|https://streams.90s90s.de/90s00s/mp3-192/streams.90s90s.de/"
+        "Klassik Radio|http://live.streams.klassikradio.de/klassikradio-deutschland/stream/mp3",
+        "Toggo Radio|http://radio.toggo.de/live/mp3-128/airable",
+        "BEATS Radio|http://stream.klassikradio.de/beats/mp3",
+        "80s80s|http://streams.80s80s.de/web/mp3-192/streams.80s80s.de/",
+        "90s90s|http://streams.90s90s.de/90s00s/mp3-192/streams.90s90s.de/"
       }
 
   #
@@ -350,7 +425,7 @@ script:
           const std::string name = entry.substr(0, sep);
           const std::string url = (sep == std::string::npos) ? std::string() : entry.substr(sep + 1);
 
-          lv_label_set_text(id(lbl_station), name.c_str());
+          lv_label_set_text(id(lbl_station_name), name.c_str());
 
           if (play && !url.empty()) {
             // set_media_url alone. Adding a PLAY command on top logged
@@ -398,10 +473,16 @@ speaker:
 # format: MP3 is what pulls in the decoder, and it is what costs the flash:
 # 76.4% -> 85.5% measured on this config.
 #
+# TWO ENTRIES, ONE RADIO. This one owns the audio and is internal:; the
+# radio_proxy below it is what Home Assistant sees. See components/radio_proxy/
+# for why - in short, the stream URL exists only inside the MediaPlayerCall
+# that carries it, and nothing but the player receiving that call can read it.
+#
 media_player:
   - platform: speaker
     id: radio_player
-    name: Radio
+    name: Radio Engine
+    internal: true
     volume_initial: 50%
 
     #
@@ -471,6 +552,63 @@ media_player:
       sample_rate: 44100
       num_channels: 1
 
+  #
+  # The entity Home Assistant sees. It plays nothing: every command is copied
+  # onto radio_player above and performed there, and this player's state,
+  # volume and mute are read back from it - so there is one radio, with one
+  # state, under one name.
+  #
+  # What it adds is on_media_url. A URL sent from Home Assistant used to
+  # reach the pipeline and nothing else: icy_info was never told about it, so
+  # the panel kept the station name of whatever the buttons last selected and
+  # showed no title and no bitrate at all. Now the same three labels fill for
+  # an outside stream as for one off the list.
+  #
+  # It fires ONLY for commands from outside. station_apply and the buttons
+  # address radio_player directly and set the poller themselves, so nothing
+  # here runs twice.
+  #
+  - platform: radio_proxy
+    id: radio_proxy_player
+    name: Radio
+    target: radio_player
+    on_media_url:
+      then:
+        # Point the poller at the stream and ask it to look now. Same pair as
+        # in station_apply, and the same reason: request_now() stands back a
+        # few seconds so the metadata connection does not compete with the
+        # pipeline's allocations.
+        - lambda: |-
+            id(icy_id)->set_url(x);
+            id(icy_id)->request_now();
+
+        # Something in the station line immediately, rather than the previous
+        # station's name for the seconds until icy-name arrives - and rather
+        # than a blank, because an https URL has no ICY poll at all and would
+        # leave it blank for good.
+        #
+        # The host is what a URL can be asked for honestly. It is not the
+        # station's name and does not pretend to be one; icy_name replaces it
+        # as soon as the poller has the real thing.
+        - lvgl.label.update:
+            id: lbl_station_name
+            text: !lambda |-
+              size_t start = x.find("://");
+              start = (start == std::string::npos) ? 0 : start + 3;
+              size_t end = x.find('/', start);
+              std::string host = (end == std::string::npos) ? x.substr(start)
+                                                            : x.substr(start, end - start);
+              // user:pass@ and :port are part of the URL, not of the name.
+              size_t at = host.rfind('@');
+              if (at != std::string::npos) {
+                host.erase(0, at + 1);
+              }
+              size_t colon = host.rfind(':');
+              if (colon != std::string::npos) {
+                host.erase(colon);
+              }
+              return host;
+
 #
 # Stream title and bitrate, from the ICY metadata the audio reader never asks
 # for - a local component, components/icy_info/. It opens its own short-lived
@@ -496,7 +634,7 @@ icy_info:
     on_value:
       then:
         - lvgl.label.update:
-            id: lbl_station
+            id: lbl_station_name
             text: !lambda 'return x;'
 
   stream_title:
@@ -505,7 +643,7 @@ icy_info:
     on_value:
       then:
         - lvgl.label.update:
-            id: lbl_rds
+            id: lbl_stream_title
             text: !lambda 'return x;'
   bitrate:
     id: icy_bitrate
@@ -659,20 +797,24 @@ sensor:
     update_interval: 30s
 
 #
-# https://esphome.io/components/media_source
+# NO media_source: BLOCK, and that is not an omission.
 #
-media_source:
-  - platform: audio_http
-    id: http_source
-    # 16kB, down from the 50000 default. It is allocated as one ring buffer
-    # plus a transfer buffer of min(24kB, half of this), so the default was
-    # asking for ~75kB on a device that has about 148kB in total.
-    #
-    # Note this path is NOT what plays the stations: station_apply calls
-    # set_media_url with a plain http URL, which the media_player's own
-    # pipeline reads (the "ann_read" ring buffer in the log). This source only
-    # serves media-source:// URIs, i.e. playback started from Home Assistant.
-    buffer_size: 16000
+# There was one here (platform: audio_http), on the assumption that it served
+# playback started from Home Assistant. It served nothing. media_source
+# instances are consumed by exactly one thing: the newer speaker_source
+# media_player, through the sources: list of one of its pipelines
+# (speaker_source/media_player.py, CONF_SOURCES). The speaker media_player
+# used above does not include media_source.h at all - it reads URLs itself,
+# via its own AudioPipeline.
+#
+# Home Assistant never sends a media-source:// URI either; it resolves those
+# on its side and hands over a plain http(s) URL, which is what radio_proxy
+# now catches on the way past.
+#
+# Bring the block back only together with a move to platform: speaker_source -
+# and then re-measure the buffers, because that path decodes through
+# micro_decoder rather than the pipeline the numbers above were fitted to.
+#
 
 #
 # https://esphome.io/components/display
@@ -752,6 +894,134 @@ touchscreen:
     mirror_y: true
 
 #
+# https://esphome.io/components/interval
+#
+# THE VU METER. It lives out here, not in the lvgl: block below, because that
+# block is regenerated from the designer and everything in it is disposable -
+# the four widgets are, this is not.
+#
+# What was there before was a meter widget with a needle parked at 50. Nothing
+# ever wrote to it: there was no source for a level anywhere in the config,
+# and a needle that never moves is decoration, not an instrument. The level
+# now comes from the audio itself - dac_speaker sums the squares of the
+# samples in the pass where it downmixes them and hands out the loudest chunk
+# RMS per channel (see pop_level() there), so this reads what is actually
+# going to the amplifier, per channel, before the volume knob.
+#
+# 100ms, and that is a considered rate rather than "fast enough". A VU meter
+# integrates over 300ms by definition, so ten reads a second is already
+# finer-grained than the instrument being imitated; going faster would only
+# spend SPI time redrawing a 320x6 strip that nobody can read that quickly.
+#
+interval:
+  - interval: 100ms
+    id: vu_tick
+    then:
+      - lambda: |-
+          //
+          // dB, not linear. A linear bar spends nine tenths of its length on
+          // the top 20dB and shows nothing at all for quiet passages; music
+          // that sits at -20dBFS would never leave the first tenth. The
+          // 48dB window below is what a small meter can usefully resolve.
+          //
+          static const float FLOOR_DB = -48.0f;
+
+          // Attack instant, release rate-limited: the meter must be at the
+          // peak on the tick it happens, and must not drop out from under it
+          // between two beats. 25dB/s empties the scale in ~2s, which is the
+          // ballistic a bar meter is normally given.
+          static const float DECAY_DB = 2.5f;
+
+          // The peak marker: sits still for 1.2s, then walks down at 6dB/s.
+          // The hold is the point of it - it is what makes a transient
+          // readable on a display refreshed ten times a second.
+          static const float PEAK_DECAY_DB = 0.6f;
+          static const uint8_t HOLD_TICKS = 12;
+
+          static const int16_t MARKER_W = 3;
+
+          //
+          // State, as function-local statics rather than globals:. Nothing
+          // outside this lambda reads it, none of it survives a reboot in any
+          // useful sense, and five arrays in globals: would be five
+          // components registered for values that are meaningless the moment
+          // the music stops.
+          //
+          static float level_db[2] = {FLOOR_DB, FLOOR_DB};
+          static float peak_db[2] = {FLOOR_DB, FLOOR_DB};
+          static uint8_t hold[2] = {0, 0};
+          static int last_value[2] = {-1, -1};
+          static int last_x[2] = {-1, -1};
+
+          lv_obj_t *bars[2] = {id(vu_left), id(vu_right)};
+          lv_obj_t *marks[2] = {id(vu_left_peak), id(vu_right_peak)};
+
+          for (uint8_t ch = 0; ch < 2; ch++) {
+            // Reading clears the slot, so a silent stream really does report
+            // silence rather than the last loud thing it heard.
+            const float level = id(radio_speaker)->pop_level(ch);
+            float db = (level <= 0.0f) ? FLOOR_DB : 20.0f * std::log10(level);
+            db = std::max(FLOOR_DB, std::min(0.0f, db));
+
+            if (db > level_db[ch]) {
+              level_db[ch] = db;
+            } else {
+              level_db[ch] = std::max(db, level_db[ch] - DECAY_DB);
+            }
+
+            if (level_db[ch] >= peak_db[ch]) {
+              peak_db[ch] = level_db[ch];
+              hold[ch] = HOLD_TICKS;
+            } else if (hold[ch] > 0) {
+              hold[ch]--;
+            } else {
+              peak_db[ch] = std::max(level_db[ch], peak_db[ch] - PEAK_DECAY_DB);
+            }
+
+            const int value = (int) ((level_db[ch] - FLOOR_DB) / -FLOOR_DB * 1000.0f);
+            if (value != last_value[ch]) {
+              last_value[ch] = value;
+              lv_bar_set_value(bars[ch], value, LV_ANIM_OFF);
+
+              // Green until -12dBFS, amber to -3, red above it. The colour is
+              // set on the indicator part, so the track behind stays dark
+              // whatever the bar is doing.
+              const uint32_t colour = level_db[ch] >= -3.0f    ? 0xD50000
+                                      : level_db[ch] >= -12.0f ? 0xFFB300
+                                                               : 0x00C853;
+              lv_obj_set_style_bg_color(bars[ch], lv_color_hex(colour), LV_PART_INDICATOR);
+            }
+
+            //
+            // The marker's position is READ OFF THE BAR, never assumed. Both
+            // are children of the same container, so the bar's own x is the
+            // offset the marker has to start from - and a bar that sits at
+            // x=20 inside vu_meter is exactly what this got wrong before:
+            // measuring from 0 put every marker 20px to the left of the bar
+            // it belongs to.
+            //
+            // Reading it each tick also means the layout can be moved,
+            // widened or turned in the designer without touching this lambda.
+            //
+            const int32_t bar_x = lv_obj_get_x(bars[ch]);
+            const int32_t track = lv_obj_get_width(bars[ch]);
+
+            // MARKER_W subtracted so the marker's RIGHT edge lands on the
+            // fill's leading edge rather than its left one - otherwise it
+            // reads as sitting a marker's width short of the level it marks.
+            // Clamped to the bar, so silence parks it flush with the start
+            // and full scale flush with the end.
+            const float frac = (peak_db[ch] - FLOOR_DB) / -FLOOR_DB;
+            int x = bar_x + (int) (frac * (float) track) - MARKER_W;
+            x = std::max<int>(bar_x, std::min<int>(x, bar_x + track - MARKER_W));
+
+            if (x != last_x[ch]) {
+              last_x[ch] = x;
+              lv_obj_set_x(marks[ch], x);
+            }
+          }
+
+#
 # https://esphome.io/components/lvgl
 #
 
@@ -767,7 +1037,35 @@ lvgl:
   theme:
     dark_mode: true
   pages:
-    - id: canvas_1
+    - id: canvas_splash
+      bg_color: 0x000000
+      pad_all: 0
+      scrollable: false
+      scrollbar_mode: "OFF"
+      widgets:
+        - label:
+            id: lbl_station_name
+            x: 0
+            y: 50
+            width: 100%
+            text: "${project_name}"
+            text_color: 0xFFFFFF
+            text_align: CENTER
+            long_mode: SCROLL
+            text_font: montserrat_28
+
+        - label:
+            id: lbl_stream_title
+            x: 0
+            y: 90
+            width: 100%
+            text: "Version ${version}"
+            text_color: 0xFFFFFF
+            text_align: CENTER
+            long_mode: SCROLL
+            text_font: montserrat_20
+
+    - id: canvas_main
       bg_color: 0x000000
       pad_all: 0
       scrollable: false
@@ -837,7 +1135,7 @@ lvgl:
             text_font: montserrat_14
 
         - label:
-            id: lbl_station
+            id: lbl_station_name
             x: 0
             y: 50
             width: 100%
@@ -848,7 +1146,7 @@ lvgl:
             text_font: montserrat_28
 
         - label:
-            id: lbl_rds
+            id: lbl_stream_title
             x: 0
             y: 90
             width: 100%
@@ -869,6 +1167,96 @@ lvgl:
             long_mode: SCROLL
             text_font: montserrat_14
         
+        # The VU meter: two bars in the band between lbl_bitrate (ends at
+        # 138) and the button grid (starts at 160), and two peak markers
+        # riding on top of them. Driven by the vu_tick interval further down -
+        # see there for the ballistics and for why this is not a meter widget
+        # any more.
+        #
+        # 0..1000 rather than 0..100: the bar is 320px wide, and on a
+        # percentage scale every step of the value jumps three pixels, which
+        # on a meter that moves continuously reads as stepping.
+        - obj:
+            id: vu_meter
+            x: 0
+            y: 175
+            width: 240
+            height: 50
+            pad_all: 0
+            bg_color: 0x555555
+            widgets:
+              - label:
+                  id: vu_label_left
+                  x: 5
+                  y: 5
+                  text: "L"
+                  text_color: 0xFFFFFF
+              - bar:
+                  id: vu_left
+                  x: 20
+                  y: 10
+                  width: 200
+                  height: 6
+                  value: 0
+                  min_value: 0
+                  max_value: 1000
+                  animated: false
+                  indicator:
+                    bg_color: 0x00C853
+                    radius: 0
+                  bg_color: 0x141414
+                  border_width: 0
+                  radius: 0
+                  pad_all: 0
+                  bg_opa: 100%
+              - obj:
+                  id: vu_left_peak
+                  x: 20
+                  y: 10
+                  width: 3
+                  height: 6
+                  bg_color: 0xFFFFFF
+                  border_width: 0
+                  radius: 0
+                  pad_all: 0
+                  scrollbar_mode: "OFF"
+
+              - label:
+                  id: vu_label_right
+                  x: 5
+                  y: 25
+                  text: "R"
+                  text_color: 0xFFFFFF
+              - bar:
+                  id: vu_right
+                  x: 20
+                  y: 30
+                  width: 200
+                  height: 6
+                  value: 0
+                  min_value: 0
+                  max_value: 1000
+                  animated: false
+                  indicator:
+                    bg_color: 0x00C853
+                    radius: 0
+                  bg_color: 0x141414
+                  border_width: 0
+                  radius: 0
+                  pad_all: 0
+                  bg_opa: 100%
+              - obj:
+                  id: vu_right_peak
+                  x: 20
+                  y: 30
+                  width: 3
+                  height: 6
+                  bg_color: 0xFFFFFF
+                  border_width: 0
+                  radius: 0
+                  pad_all: 0
+                  scrollbar_mode: "OFF"
+
         - obj:
             id: lv_obj
             x: 0
