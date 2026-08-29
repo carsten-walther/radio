@@ -1041,10 +1041,23 @@ interval:
               peak_db[ch] = std::max(level_db[ch], peak_db[ch] - PEAK_DECAY_DB);
             }
 
+            // Channel 0 is the left half of the meter and runs backwards,
+            // out of the centre towards the left edge; channel 1 is the right
+            // half and runs the ordinary way. Everything above this line is
+            // identical for both - only the drawing is mirrored.
+            const bool mirrored = (ch == 0);
+
             const int value = (int) ((level_db[ch] - FLOOR_DB) / -FLOOR_DB * 1000.0f);
             if (value != last_value[ch]) {
               last_value[ch] = value;
-              lv_bar_set_value(bars[ch], value, LV_ANIM_OFF);
+              // The mirrored bar is a RANGE bar whose value stays at the
+              // maximum: moving start_value down from 1000 grows the fill out
+              // of its right-hand end. See the widget for the rest.
+              if (mirrored) {
+                lv_bar_set_start_value(bars[ch], 1000 - value, LV_ANIM_OFF);
+              } else {
+                lv_bar_set_value(bars[ch], value, LV_ANIM_OFF);
+              }
 
               // Green until -12dBFS, amber to -3, red above it. The colour is
               // set on the indicator part, so the track behind stays dark
@@ -1069,13 +1082,20 @@ interval:
             const int32_t bar_x = lv_obj_get_x(bars[ch]);
             const int32_t track = lv_obj_get_width(bars[ch]);
 
-            // MARKER_W subtracted so the marker's RIGHT edge lands on the
-            // fill's leading edge rather than its left one - otherwise it
-            // reads as sitting a marker's width short of the level it marks.
-            // Clamped to the bar, so silence parks it flush with the start
-            // and full scale flush with the end.
+            // Where the fill currently ends, in the bar's own coordinates -
+            // and for the mirrored channel that end travels the other way,
+            // from the right-hand edge towards the left.
             const float frac = (peak_db[ch] - FLOOR_DB) / -FLOOR_DB;
-            int x = bar_x + (int) (frac * (float) track) - MARKER_W;
+            const int32_t edge = (int) ((mirrored ? 1.0f - frac : frac) * (float) track);
+
+            // The marker sits on the OUTSIDE of that edge in both cases: to
+            // its left on the right-hand channel, to its right on the left-
+            // hand one. Put it on the wrong side and it reads as sitting a
+            // marker's width short of the level it marks.
+            //
+            // Clamped to the bar, so silence parks both flush against the
+            // centre and full scale flush against the outer ends.
+            int x = bar_x + (mirrored ? edge : edge - MARKER_W);
             x = std::max<int>(bar_x, std::min<int>(x, bar_x + track - MARKER_W));
 
             if (x != last_x[ch]) {
@@ -1209,23 +1229,32 @@ lvgl:
             x: 0
             y: 95
             width: 240
-            height: 50
+            height: 40
+            bg_opa: 0%
+            border_width: 0
             pad_all: 0
             scrollbar_mode: "OFF"
             widgets:
-              - label:
-                  id: vu_label_left
-                  x: 5
-                  y: 5
-                  text: "L"
-                  text_color: 0xFFFFFF
+              # Both channels on ONE row, meeting in the middle: left grows
+              # towards the left edge, right towards the right. 98px each with
+              # a 4px gap at 120, so the two never touch and the centre stays
+              # readable as a centre.
+              #
+              # mode: RANGE is what makes the left one run backwards. A normal
+              # bar always fills from its start; a RANGE bar fills between
+              # start_value and value, so this one parks value at the maximum
+              # and moves start_value instead - the fill then grows leftwards
+              # out of the right-hand end. start_value: 1000 is an empty bar,
+              # not a full one.
               - bar:
                   id: vu_left
                   x: 20
-                  y: 10
-                  width: 200
-                  height: 6
-                  value: 0
+                  y: 15
+                  width: 98
+                  height: 10
+                  mode: RANGE
+                  value: 1000
+                  start_value: 1000
                   min_value: 0
                   max_value: 1000
                   animated: false
@@ -1239,28 +1268,21 @@ lvgl:
                   bg_opa: 100%
               - obj:
                   id: vu_left_peak
-                  x: 20
-                  y: 10
+                  x: 115
+                  y: 15
                   width: 3
-                  height: 6
+                  height: 10
                   bg_color: 0xFFFFFF
                   border_width: 0
                   radius: 0
                   pad_all: 0
                   scrollbar_mode: "OFF"
-
-              - label:
-                  id: vu_label_right
-                  x: 5
-                  y: 25
-                  text: "R"
-                  text_color: 0xFFFFFF
               - bar:
                   id: vu_right
-                  x: 20
-                  y: 30
-                  width: 200
-                  height: 6
+                  x: 122
+                  y: 15
+                  width: 98
+                  height: 10
                   value: 0
                   min_value: 0
                   max_value: 1000
@@ -1275,10 +1297,10 @@ lvgl:
                   bg_opa: 100%
               - obj:
                   id: vu_right_peak
-                  x: 20
-                  y: 30
+                  x: 122
+                  y: 15
                   width: 3
-                  height: 6
+                  height: 10
                   bg_color: 0xFFFFFF
                   border_width: 0
                   radius: 0
