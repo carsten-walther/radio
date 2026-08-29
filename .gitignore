@@ -7,3 +7,6 @@ secrets.yaml
 
 # macOS
 .DS_Store
+
+# Python Cache
+__pycache__/

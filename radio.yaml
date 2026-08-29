@@ -85,36 +85,40 @@ esphome:
         - delay: 3s
 
         #
-        # FADE_IN is a real crossfade: LVGL animates the opacity of
-        # canvas_main from 0 while canvas_splash stays underneath, so for half
-        # a second both are on screen at once.
+        # The crossfade is done with the BACKLIGHT, not with LVGL.
         #
-        # THAT COSTS HEAP, and on this board that has to be checked rather
-        # than assumed. A screen with opa < 255 and children is drawn through
-        # a SIMPLE layer, and lv_refr.c allocates a buffer for it - but not
-        # for the whole screen: the area is clipped to the strip being
-        # refreshed and then subdivided so a slice fits in
-        # LV_DRAW_LAYER_SIMPLE_BUF_SIZE, which is 24kB here (the default; this
-        # build does not override it). So the peak extra allocation is one
-        # 24kB slice at a time, taken from the ordinary heap
-        # (LV_USE_STDLIB_MALLOC is LV_STDLIB_CUSTOM) and released again as
-        # the fade walks down the screen.
+        # LVGL's own FADE_IN works and looks the same, but it animates the
+        # opacity of a whole screen, and a screen with opa < 255 and children
+        # is drawn through a layer buffer - up to a 24kB slice at a time
+        # (LV_DRAW_LAYER_SIMPLE_BUF_SIZE), taken from the same heap the audio
+        # pipeline allocates out of. This costs nothing at all: it is the LEDC
+        # duty cycle on GPIO27 ramping, in hardware, while the panel content
+        # is swapped in the dark.
         #
-        # 24kB is affordable HERE and only here: this runs three seconds after
-        # boot, with nothing playing - station_apply was called with
-        # play: false above. The same animation on a page change while a
-        # stream runs would be asking for 24kB at the worst possible moment.
-        # If it ever fails, LVGL logs "Allocating layer buffer failed. Try
-        # later" and retries on the next frame rather than crashing.
+        # turn_off/turn_on rather than brightness: 0% and brightness: 100% -
+        # the light remembers its level across an off, so turning it back on
+        # returns to whatever brightness it had rather than to a number
+        # written here. That matters the day the LDR on GPIO34 is allowed to
+        # set it.
         #
-        # 500ms: long enough to read as a fade, short enough that the slower
-        # frame rate during it (every frame is composited twice) is not
-        # noticeable on a screen nobody is touching yet.
-        #
-        - lvgl.page.show:
-            id: canvas_main
-            animation: FADE_IN
-            time: 500ms
+        - light.turn_off:
+            id: backlight
+            transition_length: 400ms
+
+        # Wait out the ramp before touching the screen. Switching the page
+        # early would show the change through the last of the fade.
+        - delay: 400ms
+
+        - lvgl.page.show: canvas_main
+
+        # One LVGL frame at 30ms intervals, so what comes up is canvas_main
+        # fully drawn rather than the tail of the splash. Cheap insurance -
+        # the panel is black for these 50ms either way.
+        - delay: 50ms
+
+        - light.turn_on:
+            id: backlight
+            transition_length: 400ms
 
 #
 # https://esphome.io/components/esp32
@@ -224,9 +228,9 @@ wifi:
     password: !secret wifi_ap_password
 
   #
-  # The other half of lbl_ip. There is no on_connect counterpart here on
-  # purpose - the wifi_info text_sensor already covers arriving, and it does it
-  # better, because it fires on the IP rather than on the association.
+  # The other half of lbl_connected. There is no on_connect counterpart here
+  # on purpose - the wifi_info text_sensor already covers arriving, and it
+  # does it better, because it fires on the IP rather than on the association.
   #
   # This is needed because nothing else covers LEAVING. On esp-idf the IP state
   # listeners are notified from IP_EVENT_STA_GOT_IP only
@@ -235,9 +239,6 @@ wifi:
   #
   on_disconnect:
     then:
-      - lvgl.label.update:
-          id: lbl_ip
-          text: "---.---.---.---"
       - lvgl.widget.update:
           id: lbl_connected
           text_color: 0x444444
@@ -592,6 +593,21 @@ media_player:
       - lvgl.label.update:
           id: lbl_play_stop
           text: "\uF04D"
+    #
+    # Volume back to the panel. This is the return path for the slider, and
+    # it is not only about the slider's own touches: Home Assistant, the
+    # radio_proxy in front of this player and volume_up/volume_down all end
+    # up in set_volume_(), which is what fires this.
+    #
+    # Raw LVGL rather than lvgl.slider.update - see the note at slider_volume
+    # for why that is what keeps the two from ping-ponging.
+    #
+    # The trigger is deferred to the main loop by the player itself, so the
+    # widget exists by the time this runs even though the volume is restored
+    # in setup().
+    on_volume:
+      - lambda: 'lv_slider_set_value(id(slider_volume), (int) roundf(x * 100.0f), LV_ANIM_OFF);'
+
     on_idle:
       - lvgl.label.update:
           id: lbl_play_stop
@@ -756,9 +772,12 @@ light:
 #
 # https://esphome.io/components/text_sensor/wifi_info
 #
-# The source for lbl_ip, and internal because it exists to feed the panel
-# rather than to be an entity - drop that line to have it in Home Assistant
-# too.
+# The source for lbl_connected, and internal because it exists to feed the
+# panel rather than to be an entity - drop that line to have it in Home
+# Assistant too.
+#
+# It still publishes the ADDRESS; the panel just no longer shows it since
+# lbl_ip was removed. The value is what decides the icon's colour below.
 #
 # This platform rather than a wifi: on_connect lambda, and the difference
 # matters: IPAddressWiFiInfo is a WiFiIPStateListener, so it fires when the
@@ -776,15 +795,6 @@ text_sensor:
       internal: true
       on_value:
         then:
-          - lvgl.label.update:
-              id: lbl_ip
-              # An unset address stringifies to 0.0.0.0, which is what this
-              # publishes while the radio is down or associated but not yet
-              # leased. Showing that as if it were an address would be a lie;
-              # the placeholder says "no network" without pretending.
-              text: !lambda |-
-                return (x.empty() || x == "0.0.0.0") ? "---.---.---.---" : x;
-
           # The icon rides the same event as the address, and reads the same
           # way: white once there is a usable connection, dim otherwise.
           # Driving both from one event is what keeps them from disagreeing -
@@ -1093,7 +1103,6 @@ lvgl:
     - id: canvas_splash
       bg_color: 0x000000
       pad_all: 0
-      scrollable: false
       scrollbar_mode: "OFF"
       widgets:
         # Own ids, NOT lbl_station_name/lbl_stream_title. Those two live on
@@ -1107,29 +1116,25 @@ lvgl:
         - label:
             id: lbl_splash_name
             x: 0
-            y: 50
-            width: 100%
+            y: 80
+            align: TOP_MID
             text: "${project_name}"
             text_color: 0xFFFFFF
             text_align: CENTER
-            long_mode: SCROLL
             text_font: montserrat_28
-
         - label:
             id: lbl_splash_version
             x: 0
-            y: 90
-            width: 100%
+            y: -10
+            align: BOTTOM_MID
             text: "Version ${version}"
             text_color: 0xFFFFFF
             text_align: CENTER
-            long_mode: SCROLL
-            text_font: montserrat_20
+            text_font: montserrat_14
 
     - id: canvas_main
       bg_color: 0x000000
       pad_all: 0
-      scrollable: false
       scrollbar_mode: "OFF"
       widgets:
         - label:
@@ -1143,26 +1148,12 @@ lvgl:
 
         - label:
             id: lbl_connected
-            x: -20
             y: 0
             align: TOP_MID
             text: "\uF1EB"
-            # Six hex digits, not seven - this read 0x4444444, which YAML
-            # accepts as the integer 71581764 and LVGL then truncates to
-            # something that is not the grey it looks like. Dim until the
-            # network is actually up; see the wifi_info sensor.
+            text_font: montserrat_14
+            text_align: CENTER
             text_color: 0x444444
-            text_font: montserrat_14
-
-        - label:
-            id: lbl_battery
-            x: 20
-            y: 0
-            align: TOP_MID
-            hidden: true
-            text: "\uF244"
-            text_color: 0xFFFFFF
-            text_font: montserrat_14
 
         - label:
             id: lbl_date
@@ -1173,34 +1164,12 @@ lvgl:
             text_color: 0xFFFFFF
             text_font: montserrat_14
 
-        - line:
-            id: lv_line
-            x: 0
-            y: 18
-            width: 100%
-            height: 1
-            points:
-              - 0, 0
-              - 100%, 0
-            line_width: 1
-            line_color: 0xB3B3B3
-
-        - label:
-            id: lbl_ip
-            x: 0
-            y: 20
-            align: TOP_MID
-            hidden: true
-            text: "---.---.---.---"
-            text_color: 0xFFFFFF
-            text_font: montserrat_14
-
         - label:
             id: lbl_station_name
             x: 0
-            y: 50
-            width: 100%
-            text: ""
+            y: 30
+            width: 240
+            text: "---"
             text_color: 0xFFFFFF
             text_align: CENTER
             long_mode: SCROLL
@@ -1209,9 +1178,9 @@ lvgl:
         - label:
             id: lbl_stream_title
             x: 0
-            y: 90
-            width: 100%
-            text: ""
+            y: 60
+            width: 240
+            text: "---"
             text_color: 0xFFFFFF
             text_align: CENTER
             long_mode: SCROLL
@@ -1219,14 +1188,12 @@ lvgl:
 
         - label:
             id: lbl_bitrate
-            x: 0
-            y: 120
-            width: 100%
-            text: ""
+            x: 20
+            y: 165
+            width: 100
+            height: 20
+            text: "--- kbit/s"
             text_color: 0xFFFFFF
-            text_align: CENTER
-            long_mode: SCROLL
-            text_font: montserrat_14
         
         # The VU meter: two bars in the band between lbl_bitrate (ends at
         # 138) and the button grid (starts at 160), and two peak markers
@@ -1240,11 +1207,11 @@ lvgl:
         - obj:
             id: vu_meter
             x: 0
-            y: 175
+            y: 95
             width: 240
             height: 50
             pad_all: 0
-            bg_color: 0x555555
+            scrollbar_mode: "OFF"
             widgets:
               - label:
                   id: vu_label_left
@@ -1318,40 +1285,61 @@ lvgl:
                   pad_all: 0
                   scrollbar_mode: "OFF"
 
+        - slider:
+            id: slider_volume
+            x: 20
+            y: 220
+            width: 200
+            height: 10
+            value: 50
+            min_value: 0
+            max_value: 100
+            radius: 9999
+            animated: false
+
+            # The slider is one half of the volume; the other half is
+            # radio_player's on_volume, which writes the slider back. The two
+            # cannot chase each other: this fires on LV_EVENT_VALUE_CHANGED
+            # (a touch) and on ESPHome's own update event, and the return path
+            # deliberately uses a raw lv_slider_set_value() rather than an
+            # lvgl.slider.update action - a raw LVGL call sends neither event,
+            # so the loop has no way to close.
+            #
+            # Fires continuously while dragging, not only on release. Setting
+            # a float is all it costs (the dac_speaker applies it per chunk in
+            # its own task), and volume that only moves when you let go feels
+            # broken.
+            on_value:
+              - media_player.volume_set:
+                  id: radio_player
+                  volume: !lambda 'return x / 100.0f;'
+
         - obj:
             id: lv_obj
             x: 0
             y: 0
-            width: 100%
-            height: 80
+            width: 240
+            height: 60
             align: BOTTOM_MID
             bg_opa: 0%
             border_width: 0
             border_opa: 0%
-            scrollbar_mode: "OFF"
             pad_all: 0
-            layout:
-              type: GRID
-              grid_rows: [FR(1), FR(1)]
-              grid_columns: [FR(1), FR(1), FR(1)]
-              grid_row_align: CENTER
-              grid_column_align: CENTER
-              pad_row: 2
-              pad_column: 2
+            scrollbar_mode: "OFF"
             widgets:
               # Step back a station. Keeps playing if it was playing, so
               # browsing switches stream rather than stopping first.
               - button:
                   id: btn_back
-                  radius: 4
+                  x: 45
+                  y: 10
+                  width: 40
+                  height: 40
+                  radius: 20
                   widgets:
                     - label:
                         align: CENTER
                         text: "\uF048"
-                  grid_cell_row_pos: 0
-                  grid_cell_column_pos: 0
-                  grid_cell_x_align: STRETCH
-                  grid_cell_y_align: STRETCH
                   on_click:
                     - lambda: 'id(station_index) -= 1;'
                     - script.execute:
@@ -1369,7 +1357,11 @@ lvgl:
               # wrong the moment one of the others acted.
               - button:
                   id: btn_play_stop
-                  radius: 4
+                  x: 90
+                  y: 0
+                  width: 60
+                  height: 60
+                  radius: 30
                   widgets:
                     # The id is what makes the glyph swappable - see the
                     # media_player's on_play/on_idle. It was not possible while
@@ -1379,10 +1371,6 @@ lvgl:
                         id: lbl_play_stop
                         align: CENTER
                         text: "\uF04B"
-                  grid_cell_row_pos: 0
-                  grid_cell_column_pos: 1
-                  grid_cell_x_align: STRETCH
-                  grid_cell_y_align: STRETCH
                   on_click:
                     - if:
                         condition:
@@ -1405,15 +1393,15 @@ lvgl:
 
               - button:
                   id: btn_next
-                  radius: 4
+                  x: 155
+                  y: 10
+                  width: 40
+                  height: 40
+                  radius: 20
                   widgets:
                     - label:
                         align: CENTER
                         text: "\uF051"
-                  grid_cell_row_pos: 0
-                  grid_cell_column_pos: 2
-                  grid_cell_x_align: STRETCH
-                  grid_cell_y_align: STRETCH
                   on_click:
                     - lambda: 'id(station_index) += 1;'
                     - script.execute:
@@ -1423,51 +1411,16 @@ lvgl:
                           return s == media_player::MEDIA_PLAYER_STATE_PLAYING ||
                                  s == media_player::MEDIA_PLAYER_STATE_ANNOUNCING;
 
-              # Volume, in the media player's volume_increment steps. The
-              # command lands in SpeakerMediaPlayer::set_volume_, which hands
-              # it to the speaker - the dac_speaker applies it in software on
-              # the next chunk, so it takes effect mid-playback.
-              - button:
-                  id: btn_vol_down
-                  radius: 4
-                  widgets:
-                    - label:
-                        align: CENTER
-                        text: "\uF027"
-                  grid_cell_row_pos: 1
-                  grid_cell_column_pos: 0
-                  grid_cell_x_align: STRETCH
-                  grid_cell_y_align: STRETCH
-                  on_click:
-                    - media_player.volume_down:
-                        id: radio_player
-
-              - button:
-                  id: btn_vol_up
-                  radius: 4
-                  widgets:
-                    - label:
-                        align: CENTER
-                        text: "\uF028"
-                  grid_cell_row_pos: 1
-                  grid_cell_column_pos: 1
-                  grid_cell_x_align: STRETCH
-                  grid_cell_y_align: STRETCH
-                  on_click:
-                    - media_player.volume_up:
-                        id: radio_player
-
               - button:
                   id: btn_settings
-                  bg_color: 0x204EF3
-                  radius: 4
+                  x: 180
+                  y: 155
+                  width: 40
+                  height: 40
+                  radius: 20
                   widgets:
                     - label:
                         align: CENTER
                         text: "\uF013"
-                  grid_cell_row_pos: 1
-                  grid_cell_column_pos: 2
-                  grid_cell_x_align: STRETCH
-                  grid_cell_y_align: STRETCH
 
 # <<< end LVGL Designer block <<<
